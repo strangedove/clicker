@@ -24,9 +24,9 @@ from parameterized import parameterized
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 from transformers.utils import is_peft_available
 
-from trl import ModelConfig
-from trl.trainer import compute_accuracy
-from trl.trainer.utils import (
+from clicker import ModelConfig
+from clicker.trainer import compute_accuracy
+from clicker.trainer.utils import (
     DataCollatorForChatML,
     RepeatSampler,
     batch_generation,

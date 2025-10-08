@@ -24,8 +24,8 @@ from transformers import is_bitsandbytes_available, is_comet_available, is_sklea
 from transformers.testing_utils import torch_device
 from transformers.utils import is_peft_available, is_rich_available, is_vision_available
 
-from trl import BaseBinaryJudge, BasePairwiseJudge
-from trl.import_utils import is_joblib_available, is_llm_blender_available, is_mergekit_available, is_vllm_available
+from clicker import BaseBinaryJudge, BasePairwiseJudge
+from clicker.import_utils import is_joblib_available, is_llm_blender_available, is_mergekit_available, is_vllm_available
 
 
 require_bitsandbytes = pytest.mark.skipif(not is_bitsandbytes_available(), reason="test requires bitsandbytes")

@@ -19,7 +19,7 @@ from transformers import AutoModelForCausalLM
 from transformers.testing_utils import require_torch_accelerator, torch_device
 from transformers.utils import is_peft_available
 
-from trl.models.activation_offloading import NoOpManager, OffloadActivations
+from clicker.models.activation_offloading import NoOpManager, OffloadActivations
 
 from .testing_utils import TrlTestCase, require_peft
 

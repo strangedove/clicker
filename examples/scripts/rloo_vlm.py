@@ -73,7 +73,7 @@ from datasets import load_dataset
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 
-from trl import (
+from clicker import (
     ModelConfig,
     RLOOConfig,
     RLOOTrainer,
@@ -83,7 +83,7 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
-from trl.rewards import think_format_reward
+from clicker.rewards import think_format_reward
 
 
 # Enable logging in a Hugging Face Space

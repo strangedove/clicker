@@ -1,12 +1,12 @@
 [build-system]
-requires = ["setuptools >= 77.0.3"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
-name = "trl"
-description = "Train transformer language models with reinforcement learning."
+name = "clicker"
+description = "Clicker train your language models"
 authors = [
-    { name = "Leandro von Werra", email = "leandro.vonwerra@gmail.com" }
+    { name = "Fizz", email = "fizzarolli@riseup.net" }
 ]
 readme = { file = "README.md", content-type = "text/markdown" }
 license = "Apache-2.0"
@@ -21,26 +21,24 @@ classifiers = [
     "Natural Language :: English",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13"
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "accelerate>=1.4.0",
     "datasets>=3.0.0",
     "transformers>=4.56.1",
-    "transformers!=4.57.0; python_version == '3.9'"
 ]
 dynamic = ["version"]
 
 [project.urls]
-Homepage = "https://github.com/huggingface/trl"
+#Homepage = "https://github.com/huggingface/trl"
 
 [project.scripts]
-trl = "trl.cli:main"
+clicker = "clicker.cli:main"
 
 [project.optional-dependencies]
 bco = [
@@ -61,6 +59,7 @@ peft = [
     "peft>=0.8.0"
 ]
 quality = [
+    "pyrefly",
     "pre-commit",
     "hf-doc-builder"
 ]
@@ -69,13 +68,6 @@ quantization = [
 ]
 scikit = [
     "scikit-learn"
-]
-test = [
-    "parameterized",
-    "pytest-cov",
-    "pytest-rerunfailures==15.1",
-    "pytest-xdist",
-    "pytest"
 ]
 vllm = [
     "vllm==0.10.2",
@@ -103,6 +95,7 @@ dev = [
     # peft
     "peft>=0.8.0",
     # quality
+    "pyrefly",
     "pre-commit",
     "hf-doc-builder",
     # quantization
@@ -110,10 +103,6 @@ dev = [
     # scikit: included in bco
     # test
     "parameterized",
-    "pytest-cov",
-    "pytest-rerunfailures==15.1",
-    "pytest-xdist",
-    "pytest",
     # vllm: not included in dev by default due to CUDA error; see GH-4228
     # vlm
     "Pillow",
@@ -121,11 +110,22 @@ dev = [
     "num2words==0.5.14"
 ]
 
-[tool.setuptools]
-package-dir = {"trl" = "trl"}
+[tool.hatch.version]
+path = "clicker/__init__.py"
+pattern = "__version__ = '(?P<version>[^']+)'"
 
-[tool.setuptools.dynamic]
-version = { file = "VERSION" }
+[tool.hatch.envs.default]
+installer = "uv"
+
+[tool.hatch.envs.dev]
+features = [
+    "dev"
+]
+
+[tool.hatch.envs.hatch-test]
+features = [
+    "dev"
+]
 
 [tool.coverage.run]
 branch = true
@@ -155,6 +155,12 @@ extend-select = ["E", "F", "I", "W", "UP", "B", "T", "C"]
 lines-after-imports = 2
 known-first-party = ["trl"]
 
+[tool.basedpyright]
+reportUnusedImport = "none"
+reportMissingTypeStubs = "none"
+reportUnknownMemberType = "none"
+reportUnknownArgumentType = "none"
+
 [tool.pytest.ini_options]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
@@ -162,4 +168,12 @@ markers = [
 ]
 addopts = [
     "-k", "not experimental",
+]
+
+[tool.pyrefly]
+project-includes = ["**/*"]
+project-excludes = [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/*venv/**/*",
 ]

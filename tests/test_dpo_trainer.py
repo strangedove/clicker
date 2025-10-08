@@ -36,7 +36,7 @@ from transformers.testing_utils import (
     require_torch_gpu_if_bnb_not_multi_backend_enabled,
 )
 
-from trl import DPOConfig, DPOTrainer, FDivergenceType
+from clicker import DPOConfig, DPOTrainer, FDivergenceType
 
 from .testing_utils import TrlTestCase, require_bitsandbytes, require_no_wandb, require_peft, require_vision
 

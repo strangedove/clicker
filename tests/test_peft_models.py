@@ -19,7 +19,7 @@ from transformers import AutoModelForCausalLM
 from transformers.testing_utils import require_torch_gpu_if_bnb_not_multi_backend_enabled
 from transformers.utils import is_peft_available
 
-from trl import AutoModelForCausalLMWithValueHead
+from clicker import AutoModelForCausalLMWithValueHead
 
 from .testing_utils import TrlTestCase, require_peft
 

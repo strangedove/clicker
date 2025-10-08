@@ -27,13 +27,13 @@ from transformers import (
 from transformers.testing_utils import require_liger_kernel
 from transformers.utils import is_peft_available
 
-from trl import GRPOConfig, GRPOTrainer
-from trl.experimental.grpo_with_replay_buffer.grpo_with_replay_buffer_config import GRPOWithReplayBufferConfig
-from trl.experimental.grpo_with_replay_buffer.grpo_with_replay_buffer_trainer import (
+from clicker import GRPOConfig, GRPOTrainer
+from clicker.experimental.grpo_with_replay_buffer.grpo_with_replay_buffer_config import GRPOWithReplayBufferConfig
+from clicker.experimental.grpo_with_replay_buffer.grpo_with_replay_buffer_trainer import (
     GRPOWithReplayBufferTrainer,
     ReplayBuffer,
 )
-from trl.experimental.gspo_token import GRPOTrainer as GSPOTokenTrainer
+from clicker.experimental.gspo_token import GRPOTrainer as GSPOTokenTrainer
 
 from .testing_utils import TrlTestCase, require_peft, require_vision, require_vllm
 

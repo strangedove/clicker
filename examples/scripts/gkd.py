@@ -57,7 +57,7 @@ import os
 from datasets import load_dataset
 from transformers import AutoTokenizer, GenerationConfig
 
-from trl import (
+from clicker import (
     GKDConfig,
     GKDTrainer,
     LogCompletionsCallback,

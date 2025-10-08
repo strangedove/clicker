@@ -15,7 +15,7 @@
 
 import torch
 
-from trl.trainer.dpo_trainer import DataCollatorForPreference
+from clicker.trainer.dpo_trainer import DataCollatorForPreference
 
 from .testing_utils import TrlTestCase
 

@@ -91,7 +91,7 @@ from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 from transformers import AutoConfig, AutoProcessor, GenerationConfig
 
-from trl import (
+from clicker import (
     LogCompletionsCallback,
     ModelConfig,
     OnlineDPOConfig,
@@ -102,7 +102,7 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
-from trl.rewards import think_format_reward
+from clicker.rewards import think_format_reward
 
 
 # Enable logging in a Hugging Face Space

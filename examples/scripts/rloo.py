@@ -37,8 +37,8 @@ from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 from peft import LoraConfig
 
-from trl import RLOOConfig, RLOOTrainer
-from trl.rewards import think_format_reward
+from clicker import RLOOConfig, RLOOTrainer
+from clicker.rewards import think_format_reward
 
 
 # Enable logging in a Hugging Face Space

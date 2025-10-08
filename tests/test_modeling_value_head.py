@@ -21,7 +21,7 @@ from packaging import version
 from parameterized import parameterized
 from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, GenerationConfig
 
-from trl import AutoModelForCausalLMWithValueHead, AutoModelForSeq2SeqLMWithValueHead, create_reference_model
+from clicker import AutoModelForCausalLMWithValueHead, AutoModelForSeq2SeqLMWithValueHead, create_reference_model
 
 from .testing_utils import TrlTestCase
 

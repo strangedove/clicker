@@ -65,7 +65,7 @@ import torch
 from datasets import load_dataset
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-from trl import (
+from clicker import (
     DPOConfig,
     DPOTrainer,
     ModelConfig,

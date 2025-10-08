@@ -30,7 +30,7 @@ from transformers.testing_utils import (
 )
 from transformers.utils import is_peft_available
 
-from trl import SFTConfig, SFTTrainer
+from clicker import SFTConfig, SFTTrainer
 
 from ..testing_utils import TrlTestCase, require_bitsandbytes, require_peft
 from .testing_constants import DEVICE_MAP_OPTIONS, GRADIENT_CHECKPOINTING_KWARGS, MODELS_TO_TEST, PACKING_OPTIONS

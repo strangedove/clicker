@@ -15,7 +15,7 @@
 
 import torch
 
-from trl.core import masked_mean, masked_var, masked_whiten
+from clicker.core import masked_mean, masked_var, masked_whiten
 
 from .testing_utils import TrlTestCase
 

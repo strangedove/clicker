@@ -32,7 +32,7 @@ import os
 from datasets import load_dataset
 from transformers import AutoModelForImageTextToText
 
-from trl import SFTConfig, SFTTrainer
+from clicker import SFTConfig, SFTTrainer
 
 
 # Enable logging in a Hugging Face Space

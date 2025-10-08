@@ -40,8 +40,8 @@ from transformers.testing_utils import (
 )
 from transformers.utils import is_peft_available
 
-from trl import GRPOConfig, GRPOTrainer
-from trl.trainer.utils import get_kbit_device_map
+from clicker import GRPOConfig, GRPOTrainer
+from clicker.trainer.utils import get_kbit_device_map
 
 from ..testing_utils import TrlTestCase, require_bitsandbytes, require_peft, require_vllm
 from .testing_constants import MODELS_TO_TEST

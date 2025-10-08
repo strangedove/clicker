@@ -17,8 +17,8 @@ from typing import Callable
 from datasets import Dataset, load_dataset
 from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
 
-from trl.extras.dataset_formatting import get_formatting_func_from_dataset
-from trl.models.utils import ChatMlSpecialTokens, clone_chat_template, setup_chat_format
+from clicker.extras.dataset_formatting import get_formatting_func_from_dataset
+from clicker.models.utils import ChatMlSpecialTokens, clone_chat_template, setup_chat_format
 
 from .testing_utils import TrlTestCase
 

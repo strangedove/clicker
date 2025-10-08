@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from trl.rewards import get_soft_overlong_punishment, think_format_reward
+from clicker.rewards import get_soft_overlong_punishment, think_format_reward
 
 from .testing_utils import TrlTestCase
 

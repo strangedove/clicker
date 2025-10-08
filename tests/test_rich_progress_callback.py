@@ -18,7 +18,7 @@ import torch.nn as nn
 from datasets import Dataset
 from transformers import Trainer, TrainingArguments
 
-from trl.trainer.callbacks import RichProgressCallback
+from clicker.trainer.callbacks import RichProgressCallback
 
 from .testing_utils import TrlTestCase, require_rich
 

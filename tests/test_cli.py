@@ -23,73 +23,67 @@ import yaml
 
 from .testing_utils import TrlTestCase
 
-
-@pytest.mark.skipif(
-    sys.version_info < (3, 10),
-    reason="Transformers' generation codebase uses a Python >3.10 syntax (`str | None`), which seems to cause the CLI tests "
-    "to fail on Python <3.10.",  # let's say it's a known issue, but not expected to be fixed, because too niche
-)
 class TestCLI(TrlTestCase):
     def test_dpo(self):
-        from trl.cli import main
+        from clicker.cli import main
 
-        command = f"trl dpo --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_preference --report_to none"
+        command = f"clicker dpo --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_preference --report_to none"
         with patch("sys.argv", command.split(" ")):
             main()
 
     def test_dpo_multiple_loss_types(self):
-        from trl.cli import main
+        from clicker.cli import main
 
-        command = f"trl dpo --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_preference --report_to none --loss_type sigmoid bco_pair --loss_weights 1.0 0.5"
+        command = f"clicker dpo --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_preference --report_to none --loss_type sigmoid bco_pair --loss_weights 1.0 0.5"
         with patch("sys.argv", command.split(" ")):
             main()
 
     @patch("sys.stdout", new_callable=StringIO)
     def test_env(self, mock_stdout):
-        from trl.cli import main
+        from clicker.cli import main
 
-        command = "trl env"
+        command = "clicker env"
         with patch("sys.argv", command.split(" ")):
             main()
-        assert "TRL version: " in mock_stdout.getvalue().strip()
+        assert "clicker version: " in mock_stdout.getvalue().strip()
 
     def test_grpo(self):
-        from trl.cli import main
+        from clicker.cli import main
 
-        command = f"trl grpo --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --reward_model_name_or_path trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_prompt_only --num_generations 4 --max_completion_length 32 --report_to none"
+        command = f"clicker grpo --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --reward_model_name_or_path trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_prompt_only --num_generations 4 --max_completion_length 32 --report_to none"
         with patch("sys.argv", command.split(" ")):
             main()
 
     def test_kto(self):
-        from trl.cli import main
+        from clicker.cli import main
 
-        command = f"trl kto --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_unpaired_preference --report_to none"
+        command = f"clicker kto --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_unpaired_preference --report_to none"
         with patch("sys.argv", command.split(" ")):
             main()
 
     def test_reward(self):
-        from trl.cli import main
+        from clicker.cli import main
 
-        command = f"trl reward --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_implicit_prompt_preference --report_to none"
+        command = f"clicker reward --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_implicit_prompt_preference --report_to none"
         with patch("sys.argv", command.split(" ")):
             main()
 
     def test_rloo(self):
-        from trl.cli import main
+        from clicker.cli import main
 
-        command = f"trl rloo --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --reward_model_name_or_path trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_prompt_only --num_generations 2 --max_completion_length 32 --report_to none"
+        command = f"clicker rloo --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --reward_model_name_or_path trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_prompt_only --num_generations 2 --max_completion_length 32 --report_to none"
         with patch("sys.argv", command.split(" ")):
             main()
 
     def test_sft(self):
-        from trl.cli import main
+        from clicker.cli import main
 
-        command = f"trl sft --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_language_modeling --report_to none"
+        command = f"clicker sft --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_language_modeling --report_to none"
         with patch("sys.argv", command.split(" ")):
             main()
 
     def test_sft_config_file(self):
-        from trl.cli import main
+        from clicker.cli import main
 
         output_dir = os.path.join(self.tmp_dir, "output")
 
@@ -107,7 +101,7 @@ class TestCLI(TrlTestCase):
             yaml.dump(config_content, config_file)
 
         # Test the CLI with config file
-        command = f"trl sft --config {config_path}"
+        command = f"clicker sft --config {config_path}"
         with patch("sys.argv", command.split(" ")):
             main()
 

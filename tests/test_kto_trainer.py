@@ -20,8 +20,8 @@ from parameterized import parameterized
 from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
 from transformers.testing_utils import require_liger_kernel
 
-from trl import KTOConfig, KTOTrainer
-from trl.trainer.kto_trainer import _get_kl_dataset, _process_tokens, _tokenize
+from clicker import KTOConfig, KTOTrainer
+from clicker.trainer.kto_trainer import _get_kl_dataset, _process_tokens, _tokenize
 
 from .testing_utils import TrlTestCase, require_no_wandb, require_peft
 

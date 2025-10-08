@@ -16,7 +16,7 @@ import time
 
 import pytest
 
-from trl import AllTrueJudge, HfPairwiseJudge, PairRMJudge
+from clicker import AllTrueJudge, HfPairwiseJudge, PairRMJudge
 
 from .testing_utils import RandomBinaryJudge, TrlTestCase, require_llm_blender
 

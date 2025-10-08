@@ -18,8 +18,8 @@ from datasets import load_dataset
 from parameterized import parameterized
 from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
 
-from trl import ORPOConfig, ORPOTrainer
-from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
+from clicker import ORPOConfig, ORPOTrainer
+from clicker.trainer.utils import SIMPLE_CHAT_TEMPLATE
 
 from .testing_utils import TrlTestCase, require_peft
 

@@ -16,7 +16,7 @@
 import torch
 from transformers import AutoModelForCausalLM, GenerationConfig
 
-from trl.models.modeling_base import GeometricMixtureWrapper, create_reference_model
+from clicker.models.modeling_base import GeometricMixtureWrapper, create_reference_model
 
 from .testing_utils import TrlTestCase
 

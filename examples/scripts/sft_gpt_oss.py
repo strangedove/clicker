@@ -54,7 +54,7 @@ import os
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, Mxfp4Config
 
-from trl import ModelConfig, ScriptArguments, SFTConfig, SFTTrainer, TrlParser, get_peft_config
+from clicker import ModelConfig, ScriptArguments, SFTConfig, SFTTrainer, TrlParser, get_peft_config
 
 
 # Enable logging in a Hugging Face Space

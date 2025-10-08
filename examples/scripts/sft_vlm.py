@@ -60,7 +60,7 @@ import torch
 from datasets import load_dataset
 from transformers import AutoModelForImageTextToText
 
-from trl import (
+from clicker import (
     ModelConfig,
     ScriptArguments,
     SFTConfig,

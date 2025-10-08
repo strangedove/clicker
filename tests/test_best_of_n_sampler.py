@@ -16,9 +16,9 @@
 import torch
 from transformers import AutoTokenizer, GenerationConfig
 
-from trl import AutoModelForCausalLMWithValueHead
-from trl.core import LengthSampler
-from trl.extras import BestOfNSampler
+from clicker import AutoModelForCausalLMWithValueHead
+from clicker.core import LengthSampler
+from clicker.extras import BestOfNSampler
 
 from .testing_utils import TrlTestCase
 

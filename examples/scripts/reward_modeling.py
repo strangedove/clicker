@@ -59,7 +59,7 @@ from accelerate import logging
 from datasets import load_dataset
 from transformers import AutoModelForSequenceClassification, HfArgumentParser
 
-from trl import (
+from clicker import (
     ModelConfig,
     RewardConfig,
     RewardTrainer,

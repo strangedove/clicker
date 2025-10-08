@@ -34,7 +34,7 @@ from transformers import (
     HfArgumentParser,
 )
 
-from trl import (
+from clicker import (
     ModelConfig,
     PPOConfig,
     PPOTrainer,
@@ -43,7 +43,7 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
-from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
+from clicker.trainer.utils import SIMPLE_CHAT_TEMPLATE
 
 
 # Enable logging in a Hugging Face Space

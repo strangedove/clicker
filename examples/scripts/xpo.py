@@ -44,7 +44,7 @@ import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer, GenerationConfig
 
-from trl import (
+from clicker import (
     HfPairwiseJudge,
     LogCompletionsCallback,
     ModelConfig,
@@ -57,7 +57,7 @@ from trl import (
     get_kbit_device_map,
     get_quantization_config,
 )
-from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
+from clicker.trainer.utils import SIMPLE_CHAT_TEMPLATE
 
 
 # Enable logging in a Hugging Face Space

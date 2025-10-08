@@ -56,7 +56,7 @@ from accelerate import logging
 from datasets import load_dataset
 from transformers import AutoModelForTokenClassification, AutoTokenizer, HfArgumentParser
 
-from trl import (
+from clicker import (
     ModelConfig,
     PRMConfig,
     PRMTrainer,

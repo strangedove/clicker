@@ -21,7 +21,7 @@ from datasets import Dataset, DatasetDict
 from parameterized import parameterized
 from transformers import AutoProcessor, AutoTokenizer
 
-from trl.data_utils import (
+from clicker.data_utils import (
     apply_chat_template,
     extract_prompt,
     is_conversational,

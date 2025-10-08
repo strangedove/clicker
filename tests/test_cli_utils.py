@@ -19,8 +19,8 @@ from unittest.mock import mock_open, patch
 import pytest
 from datasets import DatasetDict, load_dataset
 
-from trl import DatasetMixtureConfig, TrlParser, get_dataset
-from trl.scripts.utils import DatasetConfig
+from clicker import DatasetMixtureConfig, TrlParser, get_dataset
+from clicker.scripts.utils import DatasetConfig
 
 from .testing_utils import TrlTestCase
 

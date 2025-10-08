@@ -19,8 +19,8 @@ import pytest
 from transformers import AutoModelForCausalLM
 from transformers.testing_utils import require_torch_multi_accelerator, torch_device
 
-from trl.extras.vllm_client import VLLMClient
-from trl.scripts.vllm_serve import chunk_list
+from clicker.extras.vllm_client import VLLMClient
+from clicker.scripts.vllm_serve import chunk_list
 
 from .testing_utils import TrlTestCase, kill_process, require_3_accelerators
 

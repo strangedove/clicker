@@ -48,7 +48,7 @@ from datasets import load_dataset
 from PIL import Image
 from transformers import AutoModelForImageTextToText
 
-from trl import (
+from clicker import (
     DPOConfig,
     DPOTrainer,
     ModelConfig,
