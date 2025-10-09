@@ -2,14 +2,6 @@ from typing import TypeVar
 
 import torch
 
-T = TypeVar("T")
-def exact_div(a: T, b: T, custom_error_message: str = "") -> T:
-    q, r = divmod(a, b)  # pyright: ignore[reportCallIssue, reportArgumentType]
-    if r:
-        raise ValueError(f"{custom_error_message}, inexact division: {a} / {b} = {a/b}")
-    return q
-
-
 def get_exp_cap(value: torch.Tensor, decimal: int = 4) -> torch.Tensor:
     """
     Get the exponent cap of a value. This is used to cap the exponent of a value to avoid overflow. The formula is :
