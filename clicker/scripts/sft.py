@@ -83,6 +83,8 @@ from clicker import (
     get_peft_config,
     get_quantization_config,
 )
+from clicker.import_utils import is_cce_available
+from clicker.scripts.utils import load_prepared_dataset, get_tokenized_cache_path
 
 
 logger = logging.get_logger(__name__)
@@ -100,6 +102,7 @@ def main(script_args, training_args, model_args, dataset_args):
         trust_remote_code=model_args.trust_remote_code,
         attn_implementation=model_args.attn_implementation,
         dtype=model_args.dtype,
+        low_cpu_mem_usage=model_args.low_cpu_mem_usage,
     )
     quantization_config = get_quantization_config(model_args)
     if quantization_config is not None:
@@ -118,8 +121,34 @@ def main(script_args, training_args, model_args, dataset_args):
     else:
         model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, **model_kwargs)
 
+    # Apply CCE (Cut Cross-Entropy) patching for memory-efficient loss computation
+    if training_args.use_cce:
+        if not is_cce_available():
+            raise ImportError(
+                "CCE (Cut Cross-Entropy) is not available. Please install it with: pip install cut-cross-entropy"
+            )
+        try:
+            from cut_cross_entropy.transformers import cce_patch
+        except ImportError as e:
+            raise ImportError(
+                f"CCE import failed due to version incompatibility: {e}\n"
+                "This typically occurs when cut-cross-entropy is incompatible with your transformers version.\n"
+                "Try: pip install --upgrade cut-cross-entropy transformers"
+            ) from e
+
+        model = cce_patch(model)
+        logger.info("Applied CCE (Cut Cross-Entropy) patch for memory-efficient loss computation.")
+
     # Load the dataset
-    if dataset_args.datasets and script_args.dataset_name:
+    if training_args.prepared_dataset:
+        # Load from prepared dataset (created by `clicker blend`)
+        logger.info(f"Loading prepared dataset from {training_args.prepared_dataset}")
+        dataset = load_prepared_dataset(training_args.prepared_dataset)
+        logger.info(
+            f"Loaded prepared dataset: {len(dataset['train'])} train"
+            + (f", {len(dataset['test'])} test" if 'test' in dataset else "")
+        )
+    elif dataset_args.datasets and script_args.dataset_name:
         logger.warning(
             "Both `datasets` and `dataset_name` are provided. The `datasets` argument will be used to load the "
             "dataset and `dataset_name` will be ignored."
@@ -132,7 +161,7 @@ def main(script_args, training_args, model_args, dataset_args):
             script_args.dataset_name, name=script_args.dataset_config, streaming=script_args.dataset_streaming
         )
     else:
-        raise ValueError("Either `datasets` or `dataset_name` must be provided.")
+        raise ValueError("Either `prepared_dataset`, `datasets`, or `dataset_name` must be provided.")
 
     # Initialize the SFT trainer
     trainer = SFTTrainer(

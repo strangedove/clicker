@@ -81,7 +81,10 @@ if is_peft_available():
 
 if is_vllm_available():
     from vllm import LLM, SamplingParams
-    from vllm.sampling_params import GuidedDecodingParams
+    try:
+        from vllm.sampling_params import GuidedDecodingParams
+    except ImportError:
+        GuidedDecodingParams = None  # Not available in newer vLLM versions
 
 if is_wandb_available():
     import wandb
@@ -1199,6 +1202,11 @@ class RLOOTrainer(BaseTrainer):
             # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
             elif self.vllm_mode == "colocate":
                 if self.guided_decoding_regex:
+                    if GuidedDecodingParams is None:
+                        raise ImportError(
+                            "GuidedDecodingParams not available in your vLLM version. "
+                            "guided_decoding_regex requires vLLM 0.10.x."
+                        )
                     guided_decoding = GuidedDecodingParams(regex=self.guided_decoding_regex)
                 else:
                     guided_decoding = None

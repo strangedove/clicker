@@ -20,13 +20,19 @@ import torch
 from accelerate import logging
 from accelerate.commands.launch import launch_command, launch_command_parser
 
+from .scripts.blend import main as blend_main
+from .scripts.blend import make_parser as make_blend_parser
 from .scripts.dpo import make_parser as make_dpo_parser
 from .scripts.env import print_env
 from .scripts.grpo import make_parser as make_grpo_parser
 from .scripts.kto import make_parser as make_kto_parser
+from .scripts.merge_lora import main as merge_main
+from .scripts.merge_lora import make_parser as make_merge_parser
+from .scripts.orpo import make_parser as make_orpo_parser
 from .scripts.reward import make_parser as make_reward_parser
 from .scripts.rloo import make_parser as make_rloo_parser
 from .scripts.sft import make_parser as make_sft_parser
+from .scripts.train import make_parser as make_train_parser
 from .scripts.utils import TrlParser
 from .scripts.vllm_serve import main as vllm_serve_main
 from .scripts.vllm_serve import make_parser as make_vllm_serve_parser
@@ -42,13 +48,17 @@ def main():
     subparsers = parser.add_subparsers(help="available commands", dest="command", parser_class=TrlParser)
 
     # Add the subparsers for every script
+    make_blend_parser(subparsers)
     make_dpo_parser(subparsers)
     subparsers.add_parser("env", help="Print the environment information")
     make_grpo_parser(subparsers)
     make_kto_parser(subparsers)
+    make_merge_parser(subparsers)
+    make_orpo_parser(subparsers)
     make_reward_parser(subparsers)
     make_rloo_parser(subparsers)
     make_sft_parser(subparsers)
+    make_train_parser(subparsers)
     make_vllm_serve_parser(subparsers)
 
     # Parse the arguments; the remaining ones (`launch_args`) are passed to the 'accelerate launch' subparser.
@@ -83,7 +93,26 @@ def main():
         # Insert '--config_file' and the absolute path to the front of the list
         launch_args = ["--config_file", str(accelerate_config_path)] + launch_args
 
-    if args.command == "dpo":
+    if args.command == "blend":
+        # Blend/preprocess datasets - doesn't need accelerate launch
+        blend_parser = make_blend_parser()
+        config_args, remaining = blend_parser.parse_args_and_config(
+            args=sys.argv[2:], return_remaining_strings=True
+        )
+
+        # Handle --output override from remaining args
+        output_override = None
+        if "--output" in remaining:
+            idx = remaining.index("--output")
+            output_override = remaining[idx + 1]
+        elif "-o" in remaining:
+            idx = remaining.index("-o")
+            output_override = remaining[idx + 1]
+
+        config = config_args[0]
+        blend_main(config, output_override)
+
+    elif args.command == "dpo":
         # Get the default args for the launch command
         dpo_training_script = resources.files("clicker.scripts").joinpath("dpo.py")
         args = launch_command_parser().parse_args([str(dpo_training_script)])
@@ -111,6 +140,31 @@ def main():
 
         # Feed the args to the launch command
         args.training_script_args = sys.argv[2:]  # remove "trl" and "kto"
+        launch_command(args)  # launch training
+
+    elif args.command == "merge":
+        # Merge LoRA adapter into base model - doesn't need accelerate launch
+        from .scripts.merge_lora import MergeArguments
+        merge_parser = make_merge_parser()
+        merge_args = merge_parser.parse_args(sys.argv[2:])
+        # Convert namespace to MergeArguments
+        merge_arguments = MergeArguments(
+            config=merge_args.config,
+            base_model=merge_args.base_model,
+            lora_path=merge_args.lora_path,
+            output_path=merge_args.output_path,
+            weight=merge_args.weight,
+            no_gpu=merge_args.no_gpu,
+        )
+        merge_main(merge_arguments)
+
+    elif args.command == "orpo":
+        # Get the default args for the launch command
+        orpo_training_script = resources.files("clicker.scripts").joinpath("orpo.py")
+        args = launch_command_parser().parse_args([str(orpo_training_script)])
+
+        # Feed the args to the launch command
+        args.training_script_args = sys.argv[2:]  # remove "clicker" and "orpo"
         launch_command(args)  # launch training
 
     elif args.command == "reward":
@@ -141,6 +195,13 @@ def main():
         training_script_args = sys.argv[2:]  # Remove "trl" and "sft"
         args = launch_command_parser().parse_args(launch_args + [str(sft_training_script)] + training_script_args)
         launch_command(args)  # launch training
+
+    elif args.command == "train":
+        # Unified train command - dispatches based on trainer type in config
+        train_script = resources.files("clicker.scripts").joinpath("train.py")
+        training_script_args = sys.argv[2:]  # Remove "clicker" and "train"
+        args = launch_command_parser().parse_args(launch_args + [str(train_script)] + training_script_args)
+        launch_command(args)
 
     elif args.command == "vllm-serve":
         (script_args,) = parser.parse_args_and_config()

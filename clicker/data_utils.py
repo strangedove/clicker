@@ -27,6 +27,216 @@ from transformers import PreTrainedTokenizerBase, ProcessorMixin
 
 DatasetType = TypeVar("DatasetType", Dataset, DatasetDict)
 
+# Role mappings for legacy conversation formats (human/gpt -> user/assistant)
+ROLE_MAPPINGS = {
+    "human": "user",
+    "gpt": "assistant",
+    "system": "system",
+    "user": "user",
+    "assistant": "assistant",
+}
+
+# Default filler message for fix_turn_order
+DEFAULT_TURN_ORDER_FILLER = "Let's begin."
+
+
+def add_default_system_message(
+    messages: list[dict[str, str]],
+    system_message: str,
+) -> list[dict[str, str]]:
+    """
+    Add a system message to a conversation if it doesn't already have one.
+
+    Args:
+        messages: List of message dicts with 'role' and 'content' keys.
+        system_message: The system message content to add.
+
+    Returns:
+        Messages with system message added at the beginning if not already present.
+
+    Example:
+        >>> messages = [
+        ...     {"role": "user", "content": "Hello!"},
+        ...     {"role": "assistant", "content": "Hi there!"},
+        ... ]
+        >>> add_default_system_message(messages, "You are a helpful assistant.")
+        [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hello!"},
+            {"role": "assistant", "content": "Hi there!"},
+        ]
+    """
+    if not messages:
+        return messages
+
+    # Check if first message is already a system message
+    first_role = messages[0].get("role", "").lower()
+    first_role = ROLE_MAPPINGS.get(first_role, first_role)
+
+    if first_role == "system":
+        # Already has a system message, don't modify
+        return messages
+
+    # Prepend system message
+    return [{"role": "system", "content": system_message}] + messages
+
+
+def add_system_message_to_example(
+    example: dict[str, Any],
+    system_message: str,
+) -> dict[str, Any]:
+    """
+    Add a default system message to all conversation fields in an example.
+
+    Checks for per-dataset `_system_message` column first, falling back to the provided
+    global default.
+
+    Args:
+        example: A single data entry that may contain conversation fields.
+        system_message: Default system message to add (global fallback).
+
+    Returns:
+        Example with system message added to all conversation fields.
+    """
+    result = dict(example)
+
+    # Per-dataset system_message overrides global default
+    effective_message = result.pop("_system_message", None) or system_message
+    if not effective_message:
+        return result
+
+    # Add system message to all conversation-like keys
+    for key in ["messages", "prompt", "chosen", "rejected", "completion", "conversations"]:
+        if key in result and isinstance(result[key], list):
+            messages = result[key]
+            if messages and isinstance(messages[0], dict):
+                # Check if it looks like a conversation (has role/content or from/value)
+                first_msg = messages[0]
+                if ("role" in first_msg and "content" in first_msg) or ("from" in first_msg and "value" in first_msg):
+                    result[key] = add_default_system_message(messages, effective_message)
+
+    return result
+
+
+def fix_conversation_turn_order(
+    messages: list[dict[str, str]],
+    filler_message: str = DEFAULT_TURN_ORDER_FILLER,
+) -> list[dict[str, str]]:
+    """
+    Fix conversation turn order to ensure strict system/user/assistant alternation.
+
+    This function handles models with strict turn order requirements (e.g., Llama) by:
+    1. Adding a filler user message if conversation starts with assistant (after optional system)
+    2. Merging consecutive messages from the same role into one
+    3. Dropping trailing user messages so conversations end with assistant
+
+    Args:
+        messages: List of message dicts with 'role' and 'content' keys.
+        filler_message: Message to insert when a user turn is missing at the start.
+
+    Returns:
+        Fixed list of messages with proper turn order.
+
+    Example:
+        >>> messages = [
+        ...     {"role": "assistant", "content": "Hello!"},
+        ...     {"role": "user", "content": "Hi"},
+        ...     {"role": "user", "content": "How are you?"},
+        ...     {"role": "assistant", "content": "I'm good!"},
+        ...     {"role": "user", "content": "Great"},
+        ... ]
+        >>> fix_conversation_turn_order(messages)
+        [
+            {"role": "user", "content": "Let's begin."},
+            {"role": "assistant", "content": "Hello!"},
+            {"role": "user", "content": "Hi\n\nHow are you?"},
+            {"role": "assistant", "content": "I'm good!"},
+        ]
+    """
+    if not messages:
+        return messages
+
+    result = []
+
+    # Step 1: Extract system message if present at the start
+    system_message = None
+    start_idx = 0
+    if messages[0].get("role") == "system":
+        system_message = messages[0]
+        start_idx = 1
+
+    # Check if we need to add a filler user message
+    # (conversation starts with assistant after optional system)
+    if start_idx < len(messages):
+        first_non_system = messages[start_idx]
+        first_role = first_non_system.get("role", "").lower()
+        first_role = ROLE_MAPPINGS.get(first_role, first_role)
+
+        if first_role == "assistant":
+            # Add system message first if present
+            if system_message:
+                result.append(system_message)
+            # Add filler user message
+            result.append({"role": "user", "content": filler_message})
+            # Continue from assistant message
+        elif system_message:
+            result.append(system_message)
+    elif system_message:
+        result.append(system_message)
+
+    # Step 2: Process remaining messages, merging consecutive same-role messages
+    for msg in messages[start_idx:]:
+        role = msg.get("role", "").lower()
+        role = ROLE_MAPPINGS.get(role, role)
+        content = msg.get("content", "")
+
+        if not result:
+            result.append({"role": role, "content": content})
+        elif result[-1]["role"] == role:
+            # Merge with previous message (same role)
+            result[-1]["content"] = result[-1]["content"] + "\n\n" + content
+        else:
+            result.append({"role": role, "content": content})
+
+    # Step 3: Drop trailing user messages (conversation should end with assistant)
+    while result and result[-1].get("role") == "user":
+        result.pop()
+
+    # If we removed everything except system, return empty
+    if len(result) <= 1 and result and result[0].get("role") == "system":
+        return []
+
+    return result
+
+
+def fix_example_turn_order(
+    example: dict[str, Any],
+    filler_message: str = DEFAULT_TURN_ORDER_FILLER,
+) -> dict[str, Any]:
+    """
+    Apply fix_conversation_turn_order to all conversation fields in an example.
+
+    Args:
+        example: A single data entry that may contain conversation fields.
+        filler_message: Message to insert when a user turn is missing.
+
+    Returns:
+        Example with fixed turn order in all conversation fields.
+    """
+    result = dict(example)
+
+    # Fix turn order for all conversation-like keys
+    for key in ["messages", "prompt", "chosen", "rejected", "completion", "conversations"]:
+        if key in result and isinstance(result[key], list):
+            messages = result[key]
+            if messages and isinstance(messages[0], dict):
+                # Check if it looks like a conversation (has role/content or from/value)
+                first_msg = messages[0]
+                if ("role" in first_msg and "content" in first_msg) or ("from" in first_msg and "value" in first_msg):
+                    result[key] = fix_conversation_turn_order(messages, filler_message)
+
+    return result
+
 
 def prepare_multimodal_messages(messages: list[dict[str, Any]], num_images: int) -> None:
     """
@@ -80,6 +290,8 @@ def is_conversational(example: dict[str, Any]) -> bool:
     r"""
     Check if the example is in a conversational format.
 
+    Supports both standard format (role/content) and legacy format (from/value with conversations key).
+
     Args:
         example (`dict[str, Any]`):
             A single data entry of a dataset. The example can have different keys depending on the dataset type.
@@ -98,9 +310,14 @@ def is_conversational(example: dict[str, Any]) -> bool:
     >>> example = {"prompt": "The sky is"}
     >>> is_conversational(example)
     False
+
+    >>> example = {"conversations": [{"from": "human", "value": "Hello"}]}
+    >>> is_conversational(example)
+    True
     ```
     """
-    supported_keys = ["prompt", "chosen", "rejected", "completion", "messages"]
+    # Support both standard keys and legacy 'conversations' key
+    supported_keys = ["prompt", "chosen", "rejected", "completion", "messages", "conversations"]
     example_keys = {key for key in example.keys() if key in supported_keys}
 
     # It must have one of the supported keys
@@ -108,11 +325,15 @@ def is_conversational(example: dict[str, Any]) -> bool:
         key = example_keys.pop()  # take the first supported key
         maybe_messages = example[key]
         # It must be a list of messages
-        if isinstance(maybe_messages, list):
+        if isinstance(maybe_messages, list) and len(maybe_messages) > 0:
             maybe_message = maybe_messages[0]
-            # Each message must a list of dictionaries with keys "role" and "content"
-            if isinstance(maybe_message, dict) and "role" in maybe_message and "content" in maybe_message:
-                return True
+            if isinstance(maybe_message, dict):
+                # Standard format: "role" and "content"
+                if "role" in maybe_message and "content" in maybe_message:
+                    return True
+                # Legacy format: "from" and "value"
+                if "from" in maybe_message and "value" in maybe_message:
+                    return True
 
     return False
 
@@ -274,6 +495,8 @@ def maybe_apply_chat_template(
     ```
     """
     if is_conversational(example):
+        # Normalize legacy formats (conversations -> messages, from/value -> role/content, human/gpt -> user/assistant)
+        example = maybe_convert_to_chatml(example)
         return apply_chat_template(example, tokenizer, tools, **template_kwargs)
     else:
         return example
@@ -285,8 +508,10 @@ def _unpair_row(examples: list[dict[str, list[dict[str, str]]]]) -> list[dict[st
         "completion": examples["chosen"] + examples["rejected"],
         "label": [True] * batch_size + [False] * batch_size,
     }
-    if "prompt" in examples:
-        new_rows["prompt"] = examples["prompt"] + examples["prompt"]
+    # Duplicate all columns except chosen/rejected to match the new row count
+    for key in examples:
+        if key not in ("chosen", "rejected"):
+            new_rows[key] = examples[key] + examples[key]
     return new_rows
 
 
@@ -795,6 +1020,7 @@ def maybe_convert_to_chatml(example: dict[str, list]) -> dict[str, list]:
     - Replaces the key `"from"` with `"role"` in message dictionaries.
     - Replaces the key `"value"` with `"content"` in message dictionaries.
     - Renames `"conversations"` to `"messages"` for consistency with ChatML.
+    - Maps legacy role names: `"human"` → `"user"`, `"gpt"` → `"assistant"`.
 
     Args:
         example (`dict[str, list]`):
@@ -810,8 +1036,8 @@ def maybe_convert_to_chatml(example: dict[str, list]) -> dict[str, list]:
 
     >>> example = {
     ...     "conversations": [
-    ...         {"from": "user", "value": "What color is the sky?"},
-    ...         {"from": "assistant", "value": "It is blue."},
+    ...         {"from": "human", "value": "What color is the sky?"},
+    ...         {"from": "gpt", "value": "It is blue."},
     ...     ]
     ... }
     >>> maybe_convert_to_chatml(example)
@@ -826,7 +1052,14 @@ def maybe_convert_to_chatml(example: dict[str, list]) -> dict[str, list]:
             for message in messages:
                 if isinstance(message, dict):
                     if "from" in message:
-                        message["role"] = message.pop("from")
+                        role = message.pop("from")
+                        # Map legacy role names to standard ones
+                        role = ROLE_MAPPINGS.get(role.lower(), role)
+                        message["role"] = role
+                    elif "role" in message:
+                        # Also normalize role names in standard format
+                        role = message["role"]
+                        message["role"] = ROLE_MAPPINGS.get(role.lower(), role)
                     if "value" in message:
                         message["content"] = message.pop("value")
 
@@ -835,3 +1068,527 @@ def maybe_convert_to_chatml(example: dict[str, list]) -> dict[str, list]:
         example["messages"] = example.pop("conversations")
 
     return example
+
+
+def is_preference_dataset(example: dict[str, Any]) -> bool:
+    """
+    Check if the example is from a preference dataset (has chosen/rejected columns).
+
+    Args:
+        example: A single data entry of a dataset.
+
+    Returns:
+        True if the example has 'chosen' and 'rejected' keys.
+    """
+    return "chosen" in example and "rejected" in example
+
+
+def is_binary_preference_dataset(example: dict[str, Any]) -> bool:
+    """
+    Check if the example is from a binary preference dataset (has completion and label).
+
+    This is the KTO-style format where each example has a completion and a boolean label
+    indicating whether it's a good (True) or bad (False) response.
+
+    Args:
+        example: A single data entry of a dataset.
+
+    Returns:
+        True if the example has 'completion' and 'label' keys.
+    """
+    return "completion" in example and "label" in example
+
+
+def convert_preference_to_sft(example: dict[str, Any]) -> dict[str, Any]:
+    """
+    Convert a preference dataset example to SFT format.
+
+    Takes a preference example with prompt/chosen/rejected and converts it to
+    a conversational SFT format using only the chosen response:
+    - prompt -> user message(s)
+    - chosen -> assistant message(s)
+
+    Handles both conversational and string formats.
+
+    Args:
+        example: A preference dataset example with 'prompt', 'chosen', 'rejected' keys.
+
+    Returns:
+        An SFT example with 'messages' key containing the conversation.
+
+    Example:
+        >>> example = {
+        ...     "prompt": [{"role": "user", "content": "Hello"}],
+        ...     "chosen": [{"role": "assistant", "content": "Hi there!"}],
+        ...     "rejected": [{"role": "assistant", "content": "Go away"}],
+        ... }
+        >>> convert_preference_to_sft(example)
+        {'messages': [{'role': 'user', 'content': 'Hello'}, {'role': 'assistant', 'content': 'Hi there!'}]}
+
+        >>> example = {
+        ...     "prompt": "What is 2+2?",
+        ...     "chosen": "4",
+        ...     "rejected": "5",
+        ... }
+        >>> convert_preference_to_sft(example)
+        {'messages': [{'role': 'user', 'content': 'What is 2+2?'}, {'role': 'assistant', 'content': '4'}]}
+    """
+    result = {}
+
+    # Copy over any extra keys (except the preference-specific ones)
+    for key in example:
+        if key not in ("prompt", "chosen", "rejected"):
+            result[key] = example[key]
+
+    prompt = example.get("prompt", [])
+    chosen = example.get("chosen", [])
+
+    # Handle conversational format
+    if isinstance(prompt, list) and prompt and isinstance(prompt[0], dict):
+        messages = list(prompt)  # Copy prompt messages
+        if isinstance(chosen, list) and chosen and isinstance(chosen[0], dict):
+            messages.extend(chosen)
+        elif isinstance(chosen, str):
+            messages.append({"role": "assistant", "content": chosen})
+        result["messages"] = messages
+
+    # Handle string format
+    elif isinstance(prompt, str):
+        messages = [{"role": "user", "content": prompt}]
+        if isinstance(chosen, str):
+            messages.append({"role": "assistant", "content": chosen})
+        elif isinstance(chosen, list) and chosen and isinstance(chosen[0], dict):
+            messages.extend(chosen)
+        result["messages"] = messages
+
+    # Handle implicit prompt (chosen/rejected only, no prompt)
+    elif not prompt and isinstance(chosen, list) and chosen and isinstance(chosen[0], dict):
+        # The chosen already contains the full conversation
+        result["messages"] = list(chosen)
+
+    return result
+
+
+def convert_binary_preference_to_sft(example: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """
+    Convert a binary preference (KTO-style) example to SFT format.
+
+    Takes a binary preference example with prompt/completion/label and converts
+    good examples (label=True) to conversational SFT format. Bad examples are
+    filtered out by returning None.
+
+    Args:
+        example: A binary preference example with 'prompt', 'completion', 'label' keys.
+
+    Returns:
+        An SFT example with 'messages' key if label is True, None otherwise.
+
+    Example:
+        >>> example = {
+        ...     "prompt": [{"role": "user", "content": "Hello"}],
+        ...     "completion": [{"role": "assistant", "content": "Hi!"}],
+        ...     "label": True,
+        ... }
+        >>> convert_binary_preference_to_sft(example)
+        {'messages': [{'role': 'user', 'content': 'Hello'}, {'role': 'assistant', 'content': 'Hi!'}]}
+
+        >>> example = {"prompt": "Hi", "completion": "Bad response", "label": False}
+        >>> convert_binary_preference_to_sft(example)  # Returns None (filtered out)
+    """
+    # Only keep good examples
+    if not example.get("label", False):
+        return None
+
+    result = {}
+
+    # Copy over any extra keys (except the preference-specific ones)
+    for key in example:
+        if key not in ("prompt", "completion", "label"):
+            result[key] = example[key]
+
+    prompt = example.get("prompt", [])
+    completion = example.get("completion", [])
+
+    # Handle conversational format
+    if isinstance(prompt, list) and prompt and isinstance(prompt[0], dict):
+        messages = list(prompt)  # Copy prompt messages
+        if isinstance(completion, list) and completion and isinstance(completion[0], dict):
+            messages.extend(completion)
+        elif isinstance(completion, str):
+            messages.append({"role": "assistant", "content": completion})
+        result["messages"] = messages
+
+    # Handle string format
+    elif isinstance(prompt, str):
+        messages = [{"role": "user", "content": prompt}]
+        if isinstance(completion, str):
+            messages.append({"role": "assistant", "content": completion})
+        elif isinstance(completion, list) and completion and isinstance(completion[0], dict):
+            messages.extend(completion)
+        result["messages"] = messages
+
+    return result
+
+
+# =============================================================================
+# Truncation Strategies
+# =============================================================================
+
+VALID_TRUNCATION_STRATEGIES = {"truncate", "drop", "split", "truncate_turns"}
+
+
+def truncate_tokens_with_strategy(
+    input_ids: list[int],
+    attention_mask: list[int],
+    max_length: int,
+    eos_token_id: int,
+    bos_token_id: Optional[int] = None,
+    strategy: str = "truncate",
+) -> Optional[tuple[list[int], list[int]]]:
+    """
+    Truncate tokenized sequences according to the specified strategy.
+
+    Args:
+        input_ids: Token IDs to truncate.
+        attention_mask: Attention mask to truncate.
+        max_length: Maximum sequence length.
+        eos_token_id: EOS token ID (removed from truncated sequences).
+        bos_token_id: BOS token ID (optional, for split strategy).
+        strategy: Truncation strategy ("truncate" or "drop").
+
+    Returns:
+        Tuple of (input_ids, attention_mask), or None if sample should be dropped.
+
+    Note:
+        For "split" strategy, use `split_tokens_into_chunks` instead.
+        For "truncate_turns", use `truncate_conversation_by_turns` instead.
+    """
+    if len(input_ids) <= max_length:
+        return input_ids, attention_mask
+
+    if strategy == "drop":
+        return None
+
+    if strategy == "truncate":
+        input_ids = input_ids[:max_length]
+        attention_mask = attention_mask[:max_length]
+        # Remove trailing EOS if present (truncated sequences shouldn't end with EOS)
+        if input_ids and input_ids[-1] == eos_token_id:
+            input_ids = input_ids[:-1]
+            attention_mask = attention_mask[:-1]
+        return input_ids, attention_mask
+
+    raise ValueError(f"Invalid truncation strategy: {strategy}. Use 'truncate' or 'drop'.")
+
+
+def split_tokens_into_chunks(
+    input_ids: list[int],
+    attention_mask: list[int],
+    max_length: int,
+    eos_token_id: int,
+    bos_token_id: Optional[int] = None,
+) -> list[tuple[list[int], list[int]]]:
+    """
+    Split tokenized sequence into multiple chunks for continued pretraining.
+
+    - First chunk gets BOS (if present in original)
+    - Last chunk gets EOS
+    - Middle chunks get neither
+
+    Args:
+        input_ids: Token IDs to split.
+        attention_mask: Attention mask to split.
+        max_length: Maximum length per chunk.
+        eos_token_id: EOS token ID.
+        bos_token_id: BOS token ID (optional).
+
+    Returns:
+        List of (input_ids, attention_mask) tuples for each chunk.
+    """
+    if len(input_ids) <= max_length:
+        return [(input_ids, attention_mask)]
+
+    # Check if original starts with BOS
+    has_bos = bos_token_id is not None and input_ids and input_ids[0] == bos_token_id
+    # Check if original ends with EOS
+    has_eos = input_ids and input_ids[-1] == eos_token_id
+
+    # Strip BOS/EOS for chunking
+    content_ids = input_ids
+    content_mask = attention_mask
+    if has_bos:
+        content_ids = content_ids[1:]
+        content_mask = content_mask[1:]
+    if has_eos:
+        content_ids = content_ids[:-1]
+        content_mask = content_mask[:-1]
+
+    chunks = []
+    # Calculate effective chunk size (accounting for BOS/EOS we'll add)
+    first_chunk_size = max_length - (1 if has_bos else 0)
+    last_chunk_needs_eos = has_eos
+    middle_chunk_size = max_length
+
+    pos = 0
+    chunk_idx = 0
+    while pos < len(content_ids):
+        is_first = chunk_idx == 0
+        remaining = len(content_ids) - pos
+        is_last = remaining <= (max_length - (1 if last_chunk_needs_eos else 0))
+
+        if is_first and has_bos:
+            chunk_size = first_chunk_size
+        elif is_last and last_chunk_needs_eos:
+            chunk_size = max_length - 1
+        else:
+            chunk_size = middle_chunk_size
+
+        chunk_ids = content_ids[pos : pos + chunk_size]
+        chunk_mask = content_mask[pos : pos + chunk_size]
+
+        # Add BOS to first chunk
+        if is_first and has_bos:
+            chunk_ids = [bos_token_id] + chunk_ids
+            chunk_mask = [1] + chunk_mask
+
+        # Add EOS to last chunk
+        if is_last and last_chunk_needs_eos:
+            chunk_ids = chunk_ids + [eos_token_id]
+            chunk_mask = chunk_mask + [1]
+
+        chunks.append((chunk_ids, chunk_mask))
+        pos += chunk_size
+        chunk_idx += 1
+
+    return chunks
+
+
+def truncate_conversation_by_turns(
+    messages: list[dict[str, str]],
+    tokenizer,
+    max_length: int,
+    chat_template: Optional[str] = None,
+) -> Optional[list[dict[str, str]]]:
+    """
+    Truncate a conversation by dropping complete turn pairs from the end.
+
+    Preserves the system message (if present) and keeps turn pairs from the
+    beginning until the conversation fits within max_length.
+    If even a single turn pair (plus system) exceeds max_length, returns None.
+
+    Args:
+        messages: List of message dicts with 'role' and 'content'.
+        tokenizer: Tokenizer to use for length calculation.
+        max_length: Maximum token length.
+        chat_template: Optional chat template to use.
+
+    Returns:
+        Truncated messages list, or None if the sample should be dropped.
+    """
+    if not messages:
+        return None
+
+    # Separate system message if present
+    system_msg = None
+    conversation = messages
+    if messages[0].get("role") == "system":
+        system_msg = messages[0]
+        conversation = messages[1:]
+
+    if not conversation:
+        return None
+
+    # Group into turn pairs (user + assistant)
+    # Handle edge cases where conversation might not be perfectly paired
+    turn_pairs = []
+    i = 0
+    while i < len(conversation):
+        pair = [conversation[i]]
+        i += 1
+        # Collect any following messages until we hit another user message
+        while i < len(conversation) and conversation[i].get("role") != "user":
+            pair.append(conversation[i])
+            i += 1
+        turn_pairs.append(pair)
+
+    # Calculate token length for system message
+    system_tokens = 0
+    if system_msg:
+        system_text = tokenizer.apply_chat_template(
+            [system_msg], tokenize=True, add_generation_prompt=False, chat_template=chat_template
+        )
+        system_tokens = len(system_text)
+
+    # Calculate token lengths for each turn pair
+    pair_tokens = []
+    for pair in turn_pairs:
+        # Tokenize the pair in context
+        if system_msg:
+            full_conv = [system_msg] + pair
+        else:
+            full_conv = pair
+        pair_text = tokenizer.apply_chat_template(
+            full_conv, tokenize=True, add_generation_prompt=False, chat_template=chat_template
+        )
+        # Tokens for this pair = full - system
+        pair_tokens.append(len(pair_text) - system_tokens)
+
+    # Find how many pairs we can keep (from the start)
+    # We want to keep the beginning of the conversation
+    total_tokens = system_tokens
+    keep_pairs = 0
+    for tokens in pair_tokens:
+        if total_tokens + tokens <= max_length:
+            total_tokens += tokens
+            keep_pairs += 1
+        else:
+            break
+
+    # If we can't fit even one pair, drop the sample
+    if keep_pairs == 0:
+        return None
+
+    # Reconstruct messages
+    result_messages = []
+    if system_msg:
+        result_messages.append(system_msg)
+    for pair in turn_pairs[:keep_pairs]:
+        result_messages.extend(pair)
+
+    # Check if the last message is from assistant (required for training)
+    if not result_messages or result_messages[-1].get("role") != "assistant":
+        return None
+
+    return result_messages
+
+
+def apply_truncation_strategy_to_example(
+    example: dict[str, Any],
+    tokenizer,
+    max_length: int,
+    strategy: str = "truncate",
+    chat_template: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """
+    Apply truncation strategy to a single example.
+
+    This is the main entry point for applying truncation strategies. It handles:
+    - "truncate": Standard truncation with EOS removal
+    - "drop": Returns None if sequence exceeds max_length
+    - "split": Returns dict with "_split_chunks" key for post-processing
+    - "truncate_turns": For conversational data, truncates by removing turn pairs
+
+    Args:
+        example: Dataset example with 'input_ids' and 'attention_mask' (tokenized)
+                 or 'messages' (for truncate_turns before tokenization).
+        tokenizer: Tokenizer for length calculation.
+        max_length: Maximum sequence length.
+        strategy: Truncation strategy to apply.
+        chat_template: Optional chat template for truncate_turns.
+
+    Returns:
+        Modified example, or None if sample should be dropped.
+        For "split", returns example with "_split_chunks" metadata.
+    """
+    if strategy not in VALID_TRUNCATION_STRATEGIES:
+        raise ValueError(
+            f"Invalid truncation_strategy: {strategy}. "
+            f"Must be one of: {', '.join(VALID_TRUNCATION_STRATEGIES)}"
+        )
+
+    # Handle truncate_turns (operates on messages before tokenization)
+    if strategy == "truncate_turns":
+        if "messages" not in example:
+            # Fall back to regular truncate for non-conversational data
+            strategy = "truncate"
+        else:
+            truncated = truncate_conversation_by_turns(
+                example["messages"],
+                tokenizer,
+                max_length,
+                chat_template,
+            )
+            if truncated is None:
+                return None
+            result = dict(example)
+            result["messages"] = truncated
+            return result
+
+    # For other strategies, we need tokenized data
+    if "input_ids" not in example:
+        return example  # Not tokenized yet, return as-is
+
+    input_ids = example["input_ids"]
+    attention_mask = example.get("attention_mask", [1] * len(input_ids))
+
+    eos_token_id = tokenizer.eos_token_id
+    bos_token_id = tokenizer.bos_token_id
+
+    if strategy == "split":
+        if len(input_ids) <= max_length:
+            return example
+        chunks = split_tokens_into_chunks(
+            input_ids, attention_mask, max_length, eos_token_id, bos_token_id
+        )
+        # Return first chunk and store rest for expansion
+        result = dict(example)
+        result["input_ids"] = chunks[0][0]
+        result["attention_mask"] = chunks[0][1]
+        if len(chunks) > 1:
+            result["_split_chunks"] = chunks[1:]
+        return result
+
+    # truncate or drop
+    truncated = truncate_tokens_with_strategy(
+        input_ids, attention_mask, max_length, eos_token_id, bos_token_id, strategy
+    )
+    if truncated is None:
+        return None
+
+    result = dict(example)
+    result["input_ids"] = truncated[0]
+    result["attention_mask"] = truncated[1]
+    # Also truncate labels if present
+    if "labels" in result and len(result["labels"]) > len(truncated[0]):
+        result["labels"] = result["labels"][: len(truncated[0])]
+    return result
+
+
+def expand_split_chunks(dataset: "Dataset") -> "Dataset":
+    """
+    Expand split chunks into separate dataset rows.
+
+    After applying "split" strategy, examples may have "_split_chunks" metadata.
+    This function expands those into separate rows.
+
+    Args:
+        dataset: Dataset with potential "_split_chunks" columns.
+
+    Returns:
+        Dataset with chunks expanded into separate rows.
+    """
+    if "_split_chunks" not in dataset.column_names:
+        return dataset
+
+    expanded_rows = []
+    for example in dataset:
+        # Add the main example (first chunk is already in input_ids)
+        row = {k: v for k, v in example.items() if k != "_split_chunks"}
+        expanded_rows.append(row)
+
+        # Add remaining chunks
+        chunks = example.get("_split_chunks")
+        if chunks:
+            for chunk_ids, chunk_mask in chunks:
+                chunk_row = dict(row)
+                chunk_row["input_ids"] = chunk_ids
+                chunk_row["attention_mask"] = chunk_mask
+                if "labels" in chunk_row:
+                    # For split chunks, labels = input_ids (full sequence loss)
+                    chunk_row["labels"] = chunk_ids
+                expanded_rows.append(chunk_row)
+
+    # Reconstruct dataset
+    from datasets import Dataset as HFDataset
+
+    return HFDataset.from_list(expanded_rows)

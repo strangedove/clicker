@@ -1,8 +1,8 @@
-# FSDP v2 config - FULL_SHARD strategy (aggressive sharding)
+# FSDP config with CPU offload - optimized for multi-GPU with limited VRAM
 # Auto-detects transformer layer class from model._no_split_modules
 #
-# Good for: Large models that need memory optimization
-# Usage: clicker train --config my_config.yaml --accelerate_config fsdp2
+# Based on axolotl FSDP config for RTX 3090 setup
+# Usage: clicker train --config my_config.yaml --accelerate_config fsdp_offload
 
 compute_environment: LOCAL_MACHINE
 debug: false
@@ -10,25 +10,26 @@ distributed_type: FSDP
 downcast_bf16: 'no'
 enable_cpu_affinity: false
 fsdp_config:
-  # Auto-wrap policy - uses model._no_split_modules automatically
+  # Auto-wrap policy - will use model._no_split_modules automatically
+  # No need to specify fsdp_transformer_layer_cls_to_wrap!
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
 
-  # FULL_SHARD shards parameters, gradients, and optimizer states
+  # Sharding strategy
   fsdp_sharding_strategy: FULL_SHARD
 
-  # No CPU offload (use fsdp_offload for that)
-  fsdp_offload_params: false
+  # CPU offload - reduces GPU memory at cost of speed
+  fsdp_offload_params: true
   fsdp_cpu_ram_efficient_loading: true
 
-  # Activation checkpointing disabled by default
-  fsdp_activation_checkpointing: false
+  # Activation checkpointing - major memory savings
+  fsdp_activation_checkpointing: true
 
   # Sync and state management
   fsdp_sync_module_states: true
   fsdp_use_orig_params: true
   fsdp_limit_all_gathers: true
 
-  # State dict type
+  # State dict type for checkpointing
   fsdp_state_dict_type: FULL_STATE_DICT
 
 machine_rank: 0

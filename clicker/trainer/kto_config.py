@@ -85,6 +85,10 @@ class KTOConfig(TrainingArguments):
         base_model_attribute_name (`str`, *optional*, defaults to `"model"`):
             Name of the attribute in the model that contains the base model. This is used to get the base model from
             the model when the model does not have a `get_decoder` method in the case when `use_liger_loss` is `True`.
+        train_on_incomplete_assistant (`bool`, *optional*, defaults to `False`):
+            Whether to train on incomplete/truncated assistant responses without adding EOS token. When `True`, if
+            a completion is truncated due to `max_completion_length` or `max_length`, the EOS token is not appended,
+            treating it as a continuation rather than a complete response.
     """
 
     _VALID_DICT_FIELDS = TrainingArguments._VALID_DICT_FIELDS + ["model_init_kwargs", "ref_model_init_kwargs"]
@@ -232,6 +236,16 @@ class KTOConfig(TrainingArguments):
             "help": "Name of the attribute in the model that contains the base model. This is used to get the base "
             "model from the model when the model does not have a `get_decoder` method in the case when "
             "`use_liger_loss` is `True`."
+        },
+    )
+    train_on_incomplete_assistant: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to train on incomplete/truncated assistant responses without adding EOS token. "
+                "When `True`, if a completion is truncated due to `max_completion_length` or `max_length`, "
+                "the EOS token is not appended, treating it as a continuation rather than a complete response."
+            )
         },
     )
 

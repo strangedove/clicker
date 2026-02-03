@@ -208,10 +208,16 @@ def _process_tokens(example: dict[str, Any], model: "PreTrainedModel" = None, **
                 else:
                     raise ValueError(f"Unknown truncation mode: {kwargs['truncation_mode']}")
 
+        # Track answer length before truncation for train_on_incomplete_assistant
+        answer_len_before_truncation = len(all_tokens["answer_input_ids"])
+
         # if that's still too long, truncate the response
         if len(all_tokens["prompt_input_ids"]) + len(all_tokens["answer_input_ids"]) > max_length:
             for k in ["answer_input_ids", "answer_attention_mask"]:
                 all_tokens[k] = all_tokens[k][: max_length - kwargs["max_prompt_length"]]
+
+        # Check if answer was truncated
+        answer_was_truncated = len(all_tokens["answer_input_ids"]) < answer_len_before_truncation
 
         # all input_ids and attention mask as is. We then check if we need to add BOS/EOS tokens
         batch[f"{kwargs['prefix']}prompt_input_ids"] = all_tokens["prompt_input_ids"]
@@ -239,13 +245,16 @@ def _process_tokens(example: dict[str, Any], model: "PreTrainedModel" = None, **
                     f"{kwargs['prefix']}completion_attention_mask"
                 ]
         # add EOS, which affects only the full completion
-        if len(all_tokens["answer_input_ids"]) == 0 or eos_token_id != all_tokens["answer_input_ids"][-1]:
-            batch[f"{kwargs['prefix']}completion_input_ids"] = batch[f"{kwargs['prefix']}completion_input_ids"] + [
-                eos_token_id
-            ]
-            batch[f"{kwargs['prefix']}completion_attention_mask"] = batch[
-                f"{kwargs['prefix']}completion_attention_mask"
-            ] + [1]
+        # Skip adding EOS if train_on_incomplete_assistant is True and the answer was truncated
+        should_skip_eos = kwargs.get("train_on_incomplete_assistant", False) and answer_was_truncated
+        if not should_skip_eos:
+            if len(all_tokens["answer_input_ids"]) == 0 or eos_token_id != all_tokens["answer_input_ids"][-1]:
+                batch[f"{kwargs['prefix']}completion_input_ids"] = batch[f"{kwargs['prefix']}completion_input_ids"] + [
+                    eos_token_id
+                ]
+                batch[f"{kwargs['prefix']}completion_attention_mask"] = batch[
+                    f"{kwargs['prefix']}completion_attention_mask"
+                ] + [1]
 
         batch[f"{kwargs['prefix']}completion_labels"] = batch[f"{kwargs['prefix']}completion_input_ids"][:]
         batch[f"{kwargs['prefix']}completion_labels"][: len(batch[f"{kwargs['prefix']}prompt_input_ids"])] = [
@@ -641,6 +650,7 @@ class KTOTrainer(BaseTrainer):
                 "label_pad_token_id": self.label_pad_token_id,
                 "max_prompt_length": self.max_prompt_length,
                 "max_completion_length": self.max_completion_length,
+                "train_on_incomplete_assistant": args.train_on_incomplete_assistant,
             }
 
             train_dataset = train_dataset.map(
@@ -1096,11 +1106,15 @@ class KTOTrainer(BaseTrainer):
         chosen_idx = [i for i in range(completion_logps.shape[0]) if batch["label"][i] is True]
         rejected_idx = [i for i in range(completion_logps.shape[0]) if batch["label"][i] is False]
 
-        chosen_logps = completion_logps[chosen_idx, ...]
-        rejected_logps = completion_logps[rejected_idx, ...]
+        # Convert indices to tensors for proper CUDA indexing (avoids kernel launch issues with large vocabs)
+        chosen_idx_t = torch.tensor(chosen_idx, dtype=torch.long, device=completion_logps.device)
+        rejected_idx_t = torch.tensor(rejected_idx, dtype=torch.long, device=completion_logps.device)
 
-        chosen_logits = completion_logits[chosen_idx, ...]
-        rejected_logits = completion_logits[rejected_idx, ...]
+        chosen_logps = torch.index_select(completion_logps, 0, chosen_idx_t)
+        rejected_logps = torch.index_select(completion_logps, 0, rejected_idx_t)
+
+        chosen_logits = torch.index_select(completion_logits, 0, chosen_idx_t)
+        rejected_logits = torch.index_select(completion_logits, 0, rejected_idx_t)
 
         if self.aux_loss_enabled:
             return (chosen_logps, rejected_logps, chosen_logits, rejected_logits, KL_logps, outputs.aux_loss)

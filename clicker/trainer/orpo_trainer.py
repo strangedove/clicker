@@ -46,6 +46,7 @@ from transformers.trainer_utils import EvalLoopOutput
 from transformers.utils import is_peft_available, is_torch_fx_proxy
 
 from ..data_utils import maybe_apply_chat_template, maybe_extract_prompt
+from ..import_utils import is_liger_kernel_available
 from .base_trainer import BaseTrainer
 from .orpo_config import ORPOConfig
 from .utils import (
@@ -63,6 +64,8 @@ from .utils import (
 if is_peft_available():
     from peft import PeftModel, get_peft_model, prepare_model_for_kbit_training
 
+if is_liger_kernel_available():
+    from liger_kernel.chunked_loss import LigerFusedLinearORPOLoss
 
 if is_wandb_available():
     import wandb
@@ -290,6 +293,19 @@ class ORPOTrainer(BaseTrainer):
         if args.disable_dropout:
             disable_dropout_in_model(model)
 
+        # Liger kernel setup
+        self.use_liger_loss = args.use_liger_loss
+        if args.use_liger_loss:
+            if not is_liger_kernel_available():
+                raise ImportError(
+                    "You set `use_liger_loss=True` but the liger kernel is not available. "
+                    "Please install liger-kernel first: `pip install liger-kernel`"
+                )
+            self.orpo_loss_fn = LigerFusedLinearORPOLoss(
+                ignore_index=args.label_pad_token_id,
+                beta=args.beta,
+            )
+
         self.max_length = max_length
         self.generate_during_eval = args.generate_during_eval
         self.label_pad_token_id = args.label_pad_token_id
@@ -488,6 +504,10 @@ class ORPOTrainer(BaseTrainer):
                 self.processing_class.eos_token_id, chosen_tokens, rejected_tokens
             )
 
+            # Track lengths before truncation for train_on_incomplete_assistant
+            chosen_len_before_truncation = len(chosen_tokens["input_ids"])
+            rejected_len_before_truncation = len(rejected_tokens["input_ids"])
+
             longer_response_length = max(len(chosen_tokens["input_ids"]), len(rejected_tokens["input_ids"]))
 
             # if combined sequence is too long, truncate the prompt
@@ -507,6 +527,20 @@ class ORPOTrainer(BaseTrainer):
                 if len(answer_tokens["prompt_input_ids"]) + longer_response_length > self.max_length:
                     for k in ["input_ids", "attention_mask"]:
                         answer_tokens[k] = answer_tokens[k][: self.max_length - self.max_prompt_length]
+
+            # If train_on_incomplete_assistant is True, remove EOS from truncated responses
+            if self.args.train_on_incomplete_assistant:
+                eos_token_id = self.processing_class.eos_token_id
+                # Check if chosen was truncated
+                if len(chosen_tokens["input_ids"]) < chosen_len_before_truncation:
+                    if chosen_tokens["input_ids"] and chosen_tokens["input_ids"][-1] == eos_token_id:
+                        chosen_tokens["input_ids"] = chosen_tokens["input_ids"][:-1]
+                        chosen_tokens["attention_mask"] = chosen_tokens["attention_mask"][:-1]
+                # Check if rejected was truncated
+                if len(rejected_tokens["input_ids"]) < rejected_len_before_truncation:
+                    if rejected_tokens["input_ids"] and rejected_tokens["input_ids"][-1] == eos_token_id:
+                        rejected_tokens["input_ids"] = rejected_tokens["input_ids"][:-1]
+                        rejected_tokens["attention_mask"] = rejected_tokens["attention_mask"][:-1]
 
             # Create labels
             chosen_sequence_tokens = {
@@ -794,6 +828,89 @@ class ORPOTrainer(BaseTrainer):
 
         return (chosen_logps, rejected_logps, chosen_logits, rejected_logits, chosen_nll_loss)
 
+    def _compute_loss_liger(
+        self, model: nn.Module, batch: dict[str, Union[list, torch.LongTensor]]
+    ) -> dict[str, torch.Tensor]:
+        """Compute ORPO loss using Liger kernel for memory efficiency."""
+        unwrapped_model = self.accelerator.unwrap_model(model)
+        concatenated_batch = self.concatenated_inputs(
+            batch,
+            is_encoder_decoder=self.is_encoder_decoder,
+            label_pad_token_id=self.label_pad_token_id,
+            padding_value=self.padding_value,
+            device=self.accelerator.device,
+        )
+        len_chosen = batch["chosen_labels"].shape[0]
+
+        model_kwargs = {}
+        if self.aux_loss_enabled:
+            model_kwargs["output_router_logits"] = True
+
+        if self.is_encoder_decoder:
+            raise NotImplementedError("Liger loss is not yet supported for encoder-decoder models in ORPO.")
+
+        # For decoder-only models
+        input_ids = concatenated_batch["concatenated_input_ids"]
+        attention_mask = concatenated_batch["concatenated_attention_mask"]
+
+        # Create loss mask - we compute loss on all tokens for ORPO (NLL on chosen, OR on both)
+        if self.is_encoder_decoder:
+            labels = concatenated_batch["concatenated_labels"].clone()
+        else:
+            labels = input_ids.clone()
+            labels = torch.where(attention_mask == 1, labels, self.label_pad_token_id)
+
+        model_kwargs["output_hidden_states"] = True
+        model_kwargs["attention_mask"] = attention_mask
+
+        # Get the base model (before LM head)
+        if hasattr(unwrapped_model, "get_decoder") and unwrapped_model.get_decoder() is not None:
+            base_model = unwrapped_model.get_decoder()
+        else:
+            base_attr = getattr(unwrapped_model, "base_model_prefix", self.args.base_model_attribute_name)
+            base_model = getattr(unwrapped_model, base_attr, unwrapped_model)
+
+        outputs = base_model(
+            input_ids,
+            use_cache=False,
+            **model_kwargs,
+        )
+        hidden_states = outputs.last_hidden_state[:, :-1]
+
+        # Shift labels for causal LM
+        shifted_labels = labels[:, 1:]
+
+        # Get the LM head
+        lm_head = unwrapped_model.get_output_embeddings()
+
+        # Compute loss using Liger kernel
+        # LigerFusedLinearORPOLoss expects: weight, input, target
+        loss_output = self.orpo_loss_fn(
+            lm_head.weight,
+            hidden_states,
+            shifted_labels,
+            bias=lm_head.bias if hasattr(lm_head, "bias") and lm_head.bias is not None else None,
+        )
+        (
+            loss,
+            (chosen_logps, rejected_logps, chosen_logits_mean, rejected_logits_mean, nll_loss, *aux_outputs),
+        ) = loss_output
+
+        output = {
+            "loss": loss,
+            "chosen_logps": chosen_logps,
+            "rejected_logps": rejected_logps,
+            "mean_chosen_logits": chosen_logits_mean,
+            "mean_rejected_logits": rejected_logits_mean,
+            "nll_loss": nll_loss,
+            "chosen_rewards": aux_outputs[0] if aux_outputs else self.beta * chosen_logps.detach(),
+            "rejected_rewards": aux_outputs[1] if len(aux_outputs) > 1 else self.beta * rejected_logps.detach(),
+        }
+        if self.aux_loss_enabled:
+            output["aux_loss"] = outputs.aux_loss
+
+        return output
+
     def get_batch_loss_metrics(
         self,
         model,
@@ -802,6 +919,42 @@ class ORPOTrainer(BaseTrainer):
     ):
         """Compute the ORPO loss and other metrics for the given batch of inputs for train or test."""
         metrics = {}
+
+        if self.use_liger_loss:
+            model_output = self._compute_loss_liger(model, batch)
+            loss = model_output["loss"]
+            policy_chosen_logps = model_output["chosen_logps"]
+            policy_rejected_logps = model_output["rejected_logps"]
+            policy_chosen_logits = model_output["mean_chosen_logits"]
+            policy_rejected_logits = model_output["mean_rejected_logits"]
+            policy_nll_loss = model_output["nll_loss"]
+            chosen_rewards = model_output["chosen_rewards"]
+            rejected_rewards = model_output["rejected_rewards"]
+
+            reward_accuracies = (chosen_rewards > rejected_rewards).float()
+
+            prefix = "eval_" if train_eval == "eval" else ""
+            metrics[f"{prefix}rewards/chosen"] = self.accelerator.gather_for_metrics(chosen_rewards).mean()
+            metrics[f"{prefix}rewards/rejected"] = self.accelerator.gather_for_metrics(rejected_rewards).mean()
+            metrics[f"{prefix}rewards/accuracies"] = self.accelerator.gather_for_metrics(reward_accuracies).mean()
+            metrics[f"{prefix}rewards/margins"] = self.accelerator.gather_for_metrics(
+                chosen_rewards - rejected_rewards
+            ).mean()
+            metrics[f"{prefix}logps/rejected"] = self.accelerator.gather_for_metrics(policy_rejected_logps).detach().mean()
+            metrics[f"{prefix}logps/chosen"] = self.accelerator.gather_for_metrics(policy_chosen_logps).detach().mean()
+            metrics[f"{prefix}logits/rejected"] = self.accelerator.gather_for_metrics(policy_rejected_logits).mean()
+            metrics[f"{prefix}logits/chosen"] = self.accelerator.gather_for_metrics(policy_chosen_logits).mean()
+            metrics[f"{prefix}nll_loss"] = self.accelerator.gather_for_metrics(policy_nll_loss).detach().mean()
+
+            if is_torch_xla_available():
+                xm.mark_step()
+            for k, v in metrics.items():
+                metrics[k] = v.item()
+
+            if self.aux_loss_enabled and "aux_loss" in model_output:
+                loss += self.aux_loss_coef * model_output["aux_loss"]
+
+            return loss, metrics
 
         forward_output = self.concatenated_forward(model, batch)
         (

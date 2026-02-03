@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from transformers import TrainingArguments
 
@@ -63,6 +63,10 @@ class ORPOConfig(TrainingArguments):
             string.
         dataset_num_proc (`int`, *optional*):
             Number of processes to use for processing the dataset.
+        train_on_incomplete_assistant (`bool`, *optional*, defaults to `False`):
+            Whether to train on incomplete/truncated assistant responses without adding EOS token. When `True`, if
+            a completion is truncated due to `max_completion_length` or `max_length`, the EOS token is not appended,
+            treating it as a continuation rather than a complete response.
     """
 
     _VALID_DICT_FIELDS = TrainingArguments._VALID_DICT_FIELDS + ["model_init_kwargs"]
@@ -161,6 +165,27 @@ class ORPOConfig(TrainingArguments):
     dataset_num_proc: Optional[int] = field(
         default=None,
         metadata={"help": "Number of processes to use for processing the dataset."},
+    )
+    train_on_incomplete_assistant: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to train on incomplete/truncated assistant responses without adding EOS token. "
+                "When `True`, if a completion is truncated due to `max_completion_length` or `max_length`, "
+                "the EOS token is not appended, treating it as a continuation rather than a complete response."
+            )
+        },
+    )
+    use_liger_loss: bool = field(
+        default=False,
+        metadata={"help": "Whether to use Liger fused linear ORPO loss for memory efficiency."},
+    )
+    base_model_attribute_name: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "The name of the attribute that contains the base model when using Liger loss and "
+            "the model does not have a `get_decoder` method."
+        },
     )
 
     def __post_init__(self):

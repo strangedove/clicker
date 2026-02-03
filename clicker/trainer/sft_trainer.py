@@ -39,12 +39,22 @@ from transformers.trainer_utils import EvalPrediction
 from transformers.utils import is_peft_available
 
 from ..data_utils import (
+    VALID_TRUNCATION_STRATEGIES,
+    add_system_message_to_example,
     apply_chat_template,
+    apply_truncation_strategy_to_example,
+    convert_binary_preference_to_sft,
+    convert_preference_to_sft,
+    expand_split_chunks,
+    fix_example_turn_order,
+    is_binary_preference_dataset,
     is_conversational,
     is_conversational_from_value,
+    is_preference_dataset,
     maybe_convert_to_chatml,
     pack_dataset,
     prepare_multimodal_messages,
+    truncate_conversation_by_turns,
     truncate_dataset,
 )
 from ..models import clone_chat_template, get_act_offloading_ctx_manager, prepare_peft_model
@@ -65,6 +75,69 @@ if is_peft_available():
 
 
 logger = logging.get_logger(__name__)
+
+
+def mask_to_last_segment_only(mask: list[int]) -> list[int]:
+    """
+    Transform an assistant mask to only keep the last contiguous segment of 1s.
+
+    This is used for `last_assistant_only_loss` where we only want to train
+    on the final assistant response in a multi-turn conversation.
+
+    Args:
+        mask: List of 0s and 1s where 1 indicates assistant tokens.
+
+    Returns:
+        Modified mask with only the last contiguous segment of 1s preserved.
+
+    Example:
+        >>> mask_to_last_segment_only([0, 0, 1, 1, 0, 0, 1, 1, 1, 0])
+        [0, 0, 0, 0, 0, 0, 1, 1, 1, 0]
+    """
+    if not mask or 1 not in mask:
+        return mask
+
+    result = [0] * len(mask)
+
+    # Find the last segment of 1s by scanning backwards
+    last_one_idx = None
+    for i in range(len(mask) - 1, -1, -1):
+        if mask[i] == 1:
+            last_one_idx = i
+            break
+
+    if last_one_idx is None:
+        return result
+
+    # Find the start of this segment
+    start_idx = last_one_idx
+    while start_idx > 0 and mask[start_idx - 1] == 1:
+        start_idx -= 1
+
+    # Set only this segment to 1
+    for i in range(start_idx, last_one_idx + 1):
+        result[i] = 1
+
+    return result
+
+
+def remove_trailing_eos(input_ids: list[int], eos_token_id: int) -> list[int]:
+    """
+    Remove trailing EOS token(s) from input_ids.
+
+    This is used for `train_on_incomplete_assistant` where we don't want
+    the model to learn to generate EOS on truncated data.
+
+    Args:
+        input_ids: List of token IDs.
+        eos_token_id: The EOS token ID to remove.
+
+    Returns:
+        input_ids with trailing EOS token(s) removed.
+    """
+    while input_ids and input_ids[-1] == eos_token_id:
+        input_ids = input_ids[:-1]
+    return input_ids
 
 
 FLASH_ATTENTION_VARIANTS = {
@@ -785,6 +858,16 @@ class SFTTrainer(BaseTrainer):
                 "You set `assistant_only_loss=True`, but the dataset is not conversational. This option is only "
                 "supported for conversational datasets."
             )
+        if args.last_assistant_only_loss and not is_conversational(dataset_sample):
+            raise ValueError(
+                "You set `last_assistant_only_loss=True`, but the dataset is not conversational. This option is only "
+                "supported for conversational datasets."
+            )
+        if args.train_on_incomplete_assistant and not is_conversational(dataset_sample):
+            raise ValueError(
+                "You set `train_on_incomplete_assistant=True`, but the dataset is not conversational. This option is "
+                "only supported for conversational datasets."
+            )
 
         # Dataset
         # Skip dataset preparation if `skip_prepare_dataset=True` in `dataset_kwargs`, or if it's a VLM, where
@@ -910,6 +993,56 @@ class SFTTrainer(BaseTrainer):
                 dataset = dataset.map(_func, batched=False, **map_kwargs)
 
             if not is_processed:
+                # Auto-convert preference datasets to SFT format
+                first_example = next(iter(dataset))
+                if is_preference_dataset(first_example):
+                    if isinstance(dataset, Dataset):
+                        map_kwargs["desc"] = f"Converting preference dataset {dataset_name} to SFT format"
+                    logger.info(
+                        f"Detected preference dataset format (chosen/rejected). "
+                        f"Converting to SFT format using 'chosen' responses."
+                    )
+                    column_names = get_dataset_column_names(dataset)
+                    remove_cols = [c for c in ["prompt", "chosen", "rejected"] if c in column_names]
+                    dataset = dataset.map(
+                        convert_preference_to_sft,
+                        remove_columns=remove_cols,
+                        **map_kwargs,
+                    )
+
+                elif is_binary_preference_dataset(first_example):
+                    if isinstance(dataset, Dataset):
+                        map_kwargs["desc"] = f"Converting binary preference dataset {dataset_name} to SFT format"
+                    logger.info(
+                        f"Detected binary preference dataset format (completion/label). "
+                        f"Converting to SFT format using good (label=True) responses only."
+                    )
+                    column_names = get_dataset_column_names(dataset)
+                    remove_cols = [c for c in ["prompt", "completion", "label"] if c in column_names]
+
+                    # Map and filter in one pass
+                    def convert_and_filter(example):
+                        result = convert_binary_preference_to_sft(example)
+                        # Return empty dict for bad examples (will be filtered)
+                        return result if result is not None else {}
+
+                    dataset = dataset.map(
+                        convert_and_filter,
+                        remove_columns=remove_cols,
+                        **map_kwargs,
+                    )
+
+                    # Filter out empty examples (bad responses)
+                    if isinstance(dataset, Dataset):
+                        original_len = len(dataset)
+                        dataset = dataset.filter(lambda x: "messages" in x and len(x["messages"]) > 0)
+                        filtered_len = len(dataset)
+                        if filtered_len < original_len:
+                            logger.info(
+                                f"Filtered out {original_len - filtered_len} bad (label=False) examples "
+                                f"from binary preference dataset."
+                            )
+
                 # Convert the dataset to ChatML if needed
                 first_example = next(iter(dataset))
                 if is_conversational_from_value(first_example):
@@ -921,6 +1054,118 @@ class SFTTrainer(BaseTrainer):
                         remove_columns="conversations" if "conversations" in column_names else None,
                         **map_kwargs,
                     )
+
+                # Add default system message if configured or per-dataset system messages exist
+                column_names = get_dataset_column_names(dataset)
+                has_per_dataset_system_msg = "_system_message" in column_names
+                if (args.default_system_message or has_per_dataset_system_msg) and is_conversational(
+                    next(iter(dataset))
+                ):
+                    if isinstance(dataset, Dataset):
+                        map_kwargs["desc"] = f"Adding default system message to {dataset_name} dataset"
+
+                    def add_system_message_fn(example, system_message):
+                        return add_system_message_to_example(example, system_message)
+
+                    # Remove _system_message column after processing (it was added by dataset mixer)
+                    remove_cols = "_system_message" if has_per_dataset_system_msg else None
+
+                    dataset = dataset.map(
+                        add_system_message_fn,
+                        fn_kwargs={"system_message": args.default_system_message or ""},
+                        remove_columns=remove_cols,
+                        **map_kwargs,
+                    )
+
+                # Fix turn order if requested (for models with strict turn order requirements)
+                if args.fix_turn_order and is_conversational(next(iter(dataset))):
+                    if isinstance(dataset, Dataset):
+                        map_kwargs["desc"] = f"Fixing turn order in {dataset_name} dataset"
+
+                    def fix_turn_order_fn(example, filler_message):
+                        return fix_example_turn_order(example, filler_message)
+
+                    dataset = dataset.map(
+                        fix_turn_order_fn,
+                        fn_kwargs={"filler_message": args.fix_turn_order_filler},
+                        **map_kwargs,
+                    )
+
+                    # Filter out empty conversations (where all messages were dropped)
+                    def has_valid_conversation(example):
+                        for key in ["messages", "prompt", "completion"]:
+                            if key in example:
+                                val = example[key]
+                                if isinstance(val, list) and len(val) > 0:
+                                    return True
+                        return False
+
+                    if isinstance(dataset, Dataset):
+                        original_len = len(dataset)
+                        dataset = dataset.filter(has_valid_conversation)
+                        filtered_len = len(dataset)
+                        if filtered_len < original_len:
+                            logger.warning(
+                                f"fix_turn_order: Filtered out {original_len - filtered_len} examples "
+                                f"with invalid turn order that couldn't be fixed."
+                            )
+
+                # Apply truncate_turns strategy before tokenization (if applicable)
+                # Get effective truncation strategy (per-dataset overrides global)
+                column_names = get_dataset_column_names(dataset)
+                has_per_dataset_strategy = "_truncation_strategy" in column_names
+                effective_strategy = args.truncation_strategy
+
+                if (
+                    effective_strategy == "truncate_turns" or has_per_dataset_strategy
+                ) and args.max_length is not None:
+                    first_example = next(iter(dataset))
+                    if is_conversational(first_example):
+                        if isinstance(dataset, Dataset):
+                            map_kwargs["desc"] = f"Truncating {dataset_name} by turns"
+
+                        def truncate_turns_fn(example, tokenizer, max_length, default_strategy):
+                            # Per-dataset strategy overrides global
+                            strategy = example.pop("_truncation_strategy", None) or default_strategy
+                            if strategy != "truncate_turns":
+                                return example  # Will be handled post-tokenization
+                            truncated = truncate_conversation_by_turns(
+                                example.get("messages", []),
+                                tokenizer,
+                                max_length,
+                            )
+                            if truncated is None:
+                                # Mark for filtering
+                                example["_truncation_drop"] = True
+                            else:
+                                example["messages"] = truncated
+                            return example
+
+                        remove_cols = "_truncation_strategy" if has_per_dataset_strategy else None
+                        dataset = dataset.map(
+                            truncate_turns_fn,
+                            fn_kwargs={
+                                "tokenizer": processing_class,
+                                "max_length": args.max_length,
+                                "default_strategy": effective_strategy,
+                            },
+                            remove_columns=remove_cols,
+                            **map_kwargs,
+                        )
+
+                        # Filter out dropped samples
+                        if isinstance(dataset, Dataset):
+                            original_len = len(dataset)
+                            dataset = dataset.filter(lambda x: not x.get("_truncation_drop", False))
+                            filtered_len = len(dataset)
+                            if filtered_len < original_len:
+                                logger.info(
+                                    f"truncate_turns: Dropped {original_len - filtered_len} samples "
+                                    f"that couldn't fit even one turn pair in max_length={args.max_length}."
+                                )
+                            # Remove the marker column
+                            if "_truncation_drop" in get_dataset_column_names(dataset):
+                                dataset = dataset.remove_columns(["_truncation_drop"])
 
                 # Apply the chat template if needed
                 first_example = next(iter(dataset))
@@ -946,7 +1191,30 @@ class SFTTrainer(BaseTrainer):
                 if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
                     map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
 
-                def tokenize_fn(example, processing_class, dataset_text_field, assistant_only_loss):
+                def tokenize_fn(
+                    example,
+                    processing_class,
+                    dataset_text_field,
+                    assistant_only_loss,
+                    last_assistant_only_loss,
+                    train_on_incomplete_assistant,
+                    eos_token_id,
+                ):
+                    # Determine if we need assistant masks (for any assistant loss mode)
+                    need_assistant_masks = assistant_only_loss or last_assistant_only_loss
+
+                    # Check if last message is from assistant (for train_on_incomplete_assistant)
+                    last_role_is_assistant = False
+                    if train_on_incomplete_assistant:
+                        messages = example.get("messages") or (
+                            example.get("prompt", []) + example.get("completion", [])
+                        )
+                        if messages and isinstance(messages, list) and len(messages) > 0:
+                            last_msg = messages[-1]
+                            if isinstance(last_msg, dict):
+                                role = last_msg.get("role") or last_msg.get("from", "")
+                                last_role_is_assistant = role.lower() in ("assistant", "gpt")
+
                     if "prompt" in example:  # prompt-completion case
                         output = {}
                         if is_conversational(example):
@@ -967,7 +1235,7 @@ class SFTTrainer(BaseTrainer):
                                 example["prompt"] + example["completion"],
                                 return_dict=True,
                                 tokenize=True,
-                                return_assistant_tokens_mask=assistant_only_loss,
+                                return_assistant_tokens_mask=need_assistant_masks,
                                 tools=example.get("tools"),
                                 **example.get("chat_template_kwargs", {}),
                             )
@@ -1007,7 +1275,7 @@ class SFTTrainer(BaseTrainer):
                                 example["messages"],
                                 return_dict=True,
                                 tokenize=True,
-                                return_assistant_tokens_mask=assistant_only_loss,
+                                return_assistant_tokens_mask=need_assistant_masks,
                                 tools=example.get("tools"),
                                 **example.get("chat_template_kwargs", {}),
                             )
@@ -1018,12 +1286,25 @@ class SFTTrainer(BaseTrainer):
                         else:
                             output = {"input_ids": processing_class(text=example[dataset_text_field])["input_ids"]}
 
+                    # Apply last_assistant_only_loss: mask all but the last assistant turn
+                    if last_assistant_only_loss and "assistant_masks" in output:
+                        output["assistant_masks"] = mask_to_last_segment_only(output["assistant_masks"])
+
+                    # Apply train_on_incomplete_assistant: remove trailing EOS if last role is assistant
+                    if train_on_incomplete_assistant and last_role_is_assistant and eos_token_id is not None:
+                        output["input_ids"] = remove_trailing_eos(output["input_ids"], eos_token_id)
+                        # Also truncate masks to match
+                        if "assistant_masks" in output:
+                            output["assistant_masks"] = output["assistant_masks"][: len(output["input_ids"])]
+                        if "completion_mask" in output:
+                            output["completion_mask"] = output["completion_mask"][: len(output["input_ids"])]
+
                     if "assistant_masks" in output and 1 not in output["assistant_masks"]:
                         raise RuntimeError(
-                            "You're using `assistant_only_loss=True`, but at least one example has no assistant "
-                            "tokens. This usually means the tokenizer's chat template doesn't generate assistant "
-                            "masks — it may be missing the `{% generation %}` keyword. Please check the template and "
-                            "ensure it's correctly configured to support assistant masking."
+                            "You're using `assistant_only_loss=True` or `last_assistant_only_loss=True`, but at least "
+                            "one example has no assistant tokens. This usually means the tokenizer's chat template "
+                            "doesn't generate assistant masks — it may be missing the `{% generation %}` keyword. "
+                            "Please check the template and ensure it's correctly configured to support assistant masking."
                         )
                     return output
 
@@ -1033,6 +1314,9 @@ class SFTTrainer(BaseTrainer):
                         "processing_class": processing_class,
                         "dataset_text_field": args.dataset_text_field,
                         "assistant_only_loss": args.assistant_only_loss,
+                        "last_assistant_only_loss": args.last_assistant_only_loss,
+                        "train_on_incomplete_assistant": args.train_on_incomplete_assistant,
+                        "eos_token_id": processing_class.eos_token_id,
                     },
                     **map_kwargs,
                 )
@@ -1055,9 +1339,57 @@ class SFTTrainer(BaseTrainer):
                 # Packing adds new column "seq_lengths" needed for document aware FlashAttention
                 dataset = pack_dataset(dataset, args.max_length, args.packing_strategy, map_kwargs)
             elif args.max_length is not None:
-                if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
-                    map_kwargs["desc"] = f"Truncating {dataset_name} dataset"
-                dataset = truncate_dataset(dataset, args.max_length, map_kwargs)
+                # Apply truncation strategy (truncate, drop, or split)
+                # Note: truncate_turns is handled before tokenization
+                strategy = args.truncation_strategy
+                if strategy == "truncate_turns":
+                    # Already handled pre-tokenization, fall back to regular truncate
+                    strategy = "truncate"
+
+                if strategy == "drop":
+                    # Filter out samples exceeding max_length
+                    if isinstance(dataset, Dataset):
+                        original_len = len(dataset)
+                        dataset = dataset.filter(lambda x: len(x.get("input_ids", [])) <= args.max_length)
+                        filtered_len = len(dataset)
+                        if filtered_len < original_len:
+                            logger.info(
+                                f"drop strategy: Filtered out {original_len - filtered_len} samples "
+                                f"exceeding max_length={args.max_length}."
+                            )
+                elif strategy == "split":
+                    # Split long sequences into chunks
+                    if isinstance(dataset, Dataset):
+                        map_kwargs["desc"] = f"Splitting {dataset_name} dataset into chunks"
+
+                    def apply_split(example, tokenizer, max_length):
+                        return apply_truncation_strategy_to_example(
+                            example, tokenizer, max_length, strategy="split"
+                        )
+
+                    dataset = dataset.map(
+                        apply_split,
+                        fn_kwargs={"tokenizer": processing_class, "max_length": args.max_length},
+                        **map_kwargs,
+                    )
+                    # Expand chunks into separate rows
+                    if isinstance(dataset, Dataset):
+                        dataset = expand_split_chunks(dataset)
+                else:
+                    # Default truncate behavior (with EOS removal for truncated samples)
+                    if isinstance(dataset, Dataset):
+                        map_kwargs["desc"] = f"Truncating {dataset_name} dataset"
+
+                    def apply_truncate(example, tokenizer, max_length):
+                        return apply_truncation_strategy_to_example(
+                            example, tokenizer, max_length, strategy="truncate"
+                        )
+
+                    dataset = dataset.map(
+                        apply_truncate,
+                        fn_kwargs={"tokenizer": processing_class, "max_length": args.max_length},
+                        **map_kwargs,
+                    )
             # For Liger kernel, ensure only the essential columns
             if args.use_liger_kernel:
                 collator_expected_keys = {"input_ids", "seq_lengths", "completion_mask", "assistant_masks"}

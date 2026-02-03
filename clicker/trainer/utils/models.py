@@ -30,12 +30,19 @@ def peft_module_casting_to_bf16(model: torch.nn.Module):
 
 def get_quantization_config(model_args: ModelConfig) -> BitsAndBytesConfig | None:
     if model_args.load_in_4bit:
+        # Convert string dtype to torch.dtype (model_args.dtype is a string like "bfloat16")
+        compute_dtype = None
+        if model_args.dtype is not None and model_args.dtype not in ["auto", None]:
+            compute_dtype = getattr(torch, model_args.dtype, torch.bfloat16)
+        else:
+            compute_dtype = torch.bfloat16  # Default to bfloat16 for 4-bit quantization
+
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=model_args.dtype,  # For consistency with model weights, we use the same value as `dtype`
+            bnb_4bit_compute_dtype=compute_dtype,
             bnb_4bit_quant_type=model_args.bnb_4bit_quant_type,
             bnb_4bit_use_double_quant=model_args.use_bnb_nested_quant,
-            bnb_4bit_quant_storage=model_args.dtype,
+            bnb_4bit_quant_storage=compute_dtype,
         )
     elif model_args.load_in_8bit:
         quantization_config = BitsAndBytesConfig(

@@ -126,6 +126,11 @@ class DPOConfig(TrainingArguments):
         tools (`Optional[list[Union[dict, Callable]]]`, *optional*):
             List of tools (callable functions) that will be accessible to the model. If the template does not support
             function calling, this argument will have no effect.
+        train_on_incomplete_assistant (`bool`, *optional*, defaults to `False`):
+            Whether to train on incomplete/truncated assistant responses without adding EOS token. When `True`, if
+            a completion is truncated due to `max_completion_length` or `max_length`, the EOS token is not appended,
+            treating it as a continuation rather than a complete response. This prevents the model from learning to
+            stop mid-thought on truncated training data.
 
         > Parameters that control the training
 
@@ -363,6 +368,17 @@ class DPOConfig(TrainingArguments):
         metadata={
             "help": "List of tools (callable functions) that will be accessible to the model. If the template does "
             "not support function calling, this argument will have no effect."
+        },
+    )
+    train_on_incomplete_assistant: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to train on incomplete/truncated assistant responses without adding EOS token. "
+                "When `True`, if a completion is truncated due to `max_completion_length` or `max_length`, "
+                "the EOS token is not appended, treating it as a continuation rather than a complete response. "
+                "This prevents the model from learning to stop mid-thought on truncated training data."
+            )
         },
     )
 

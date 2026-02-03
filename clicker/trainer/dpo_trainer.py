@@ -669,6 +669,7 @@ class DPOTrainer(BaseTrainer):
                     "max_completion_length": args.max_completion_length,
                     # for enc-dec, we add the special tokens ([bos_token] + prompt + [eos_token]; completion + [eos_token])
                     "add_special_tokens": False,
+                    "train_on_incomplete_assistant": args.train_on_incomplete_assistant,
                 },
                 **map_kwargs,
             )
@@ -682,6 +683,7 @@ class DPOTrainer(BaseTrainer):
         max_prompt_length: Optional[int] = None,
         max_completion_length: Optional[int] = None,
         add_special_tokens: bool = True,
+        train_on_incomplete_assistant: bool = False,
     ) -> dict[str, list[int]]:
         """
         Tokenize a row of the dataset.
@@ -699,6 +701,9 @@ class DPOTrainer(BaseTrainer):
                 Whether to add special tokens to the sequences. Typically used for encoder-decoder models. If `True`,
                 the prompt sequence will have a bos token prepended and an eos token appended. In any case, the
                 completion sequences will have an eos token appended.
+            train_on_incomplete_assistant (`bool`):
+                Whether to skip adding EOS token when completions are truncated. When `True`, if a completion is
+                truncated due to `max_completion_length`, the EOS token is not appended.
 
         Returns:
             `dict[str, list[int]]`:
@@ -728,6 +733,12 @@ class DPOTrainer(BaseTrainer):
                 prompt_input_ids = [tokenizer.bos_token_id] + prompt_input_ids
             if tokenizer.eos_token_id is not None:
                 prompt_input_ids = prompt_input_ids + [tokenizer.eos_token_id]
+
+        # Track original lengths to detect truncation
+        chosen_original_len = len(chosen_input_ids)
+        rejected_original_len = len(rejected_input_ids)
+
+        # Add EOS token before truncation (will be removed if truncated and train_on_incomplete_assistant is True)
         chosen_input_ids = chosen_input_ids + [tokenizer.eos_token_id]
         rejected_input_ids = rejected_input_ids + [tokenizer.eos_token_id]
 
@@ -735,8 +746,19 @@ class DPOTrainer(BaseTrainer):
         if max_prompt_length is not None:
             prompt_input_ids = prompt_input_ids[-max_prompt_length:]
         if max_completion_length is not None:
+            # Check if truncation will happen (original + EOS > max_length)
+            chosen_will_truncate = chosen_original_len + 1 > max_completion_length
+            rejected_will_truncate = rejected_original_len + 1 > max_completion_length
+
             chosen_input_ids = chosen_input_ids[:max_completion_length]
             rejected_input_ids = rejected_input_ids[:max_completion_length]
+
+            # If train_on_incomplete_assistant is True and truncation happened, remove EOS
+            if train_on_incomplete_assistant:
+                if chosen_will_truncate and chosen_input_ids and chosen_input_ids[-1] == tokenizer.eos_token_id:
+                    chosen_input_ids = chosen_input_ids[:-1]
+                if rejected_will_truncate and rejected_input_ids and rejected_input_ids[-1] == tokenizer.eos_token_id:
+                    rejected_input_ids = rejected_input_ids[:-1]
 
         return {
             "prompt_input_ids": prompt_input_ids,
@@ -751,6 +773,7 @@ class DPOTrainer(BaseTrainer):
         max_prompt_length: Optional[int] = None,
         max_completion_length: Optional[int] = None,
         add_special_tokens: bool = True,
+        train_on_incomplete_assistant: bool = False,
     ) -> dict[str, list[int]]:
         """
         Same as `tokenize_row` but for vision models. Please refer to `tokenize_row` for more information.
@@ -769,6 +792,11 @@ class DPOTrainer(BaseTrainer):
                 prompt_input_ids = [tokenizer.bos_token_id] + prompt_input_ids
             if tokenizer.eos_token_id is not None:
                 prompt_input_ids = prompt_input_ids + [tokenizer.eos_token_id]
+
+        # Track original lengths to detect truncation
+        chosen_original_len = len(chosen_input_ids)
+        rejected_original_len = len(rejected_input_ids)
+
         chosen_input_ids = chosen_input_ids + [tokenizer.eos_token_id]
         rejected_input_ids = rejected_input_ids + [tokenizer.eos_token_id]
 
@@ -776,8 +804,19 @@ class DPOTrainer(BaseTrainer):
         if max_prompt_length is not None:
             prompt_input_ids = prompt_input_ids[-max_prompt_length:]
         if max_completion_length is not None:
+            # Check if truncation will happen
+            chosen_will_truncate = chosen_original_len + 1 > max_completion_length
+            rejected_will_truncate = rejected_original_len + 1 > max_completion_length
+
             chosen_input_ids = chosen_input_ids[:max_completion_length]
             rejected_input_ids = rejected_input_ids[:max_completion_length]
+
+            # If train_on_incomplete_assistant is True and truncation happened, remove EOS
+            if train_on_incomplete_assistant:
+                if chosen_will_truncate and chosen_input_ids and chosen_input_ids[-1] == tokenizer.eos_token_id:
+                    chosen_input_ids = chosen_input_ids[:-1]
+                if rejected_will_truncate and rejected_input_ids and rejected_input_ids[-1] == tokenizer.eos_token_id:
+                    rejected_input_ids = rejected_input_ids[:-1]
 
         output = {
             "prompt_input_ids": prompt_input_ids,

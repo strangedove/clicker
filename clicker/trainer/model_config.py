@@ -177,6 +177,13 @@ class ModelConfig:
         default=False,
         metadata={"help": "Whether to use nested quantization."},
     )
+    low_cpu_mem_usage: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to use low CPU memory when loading the model. Set to False for models with custom "
+            "activation functions that have learnable parameters (e.g., xielu) which don't work with meta tensors."
+        },
+    )
     # Deprecated params
     torch_dtype: Optional[str] = field(
         default=None,

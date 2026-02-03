@@ -57,14 +57,32 @@ if is_vision_available():
 
 if is_vllm_available():
     from vllm import LLM, SamplingParams
-    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-    from vllm.distributed.parallel_state import get_world_group
-    from vllm.distributed.utils import StatelessProcessGroup
-    from vllm.sampling_params import GuidedDecodingParams
-    from vllm.utils import get_open_port
+    try:
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+    except ImportError:
+        PyNcclCommunicator = None
+    try:
+        from vllm.distributed.parallel_state import get_world_group
+    except ImportError:
+        get_world_group = None
+    try:
+        from vllm.distributed.utils import StatelessProcessGroup
+    except ImportError:
+        StatelessProcessGroup = None
+    try:
+        from vllm.sampling_params import GuidedDecodingParams
+    except ImportError:
+        GuidedDecodingParams = None  # Not available in newer vLLM versions
+    try:
+        from vllm.utils import get_open_port
+    except ImportError:
+        get_open_port = None  # Not available in newer vLLM versions
 
     if is_vllm_ascend_available():
-        from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator as PyNcclCommunicator
+        try:
+            from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator as PyNcclCommunicator
+        except ImportError:
+            pass
 
 
 logger = logging.getLogger(__name__)

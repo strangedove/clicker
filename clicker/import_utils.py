@@ -101,6 +101,7 @@ _uvicorn_available = _is_package_available("uvicorn")
 _vllm_available, _vllm_version = _is_package_available("vllm", return_version=True)
 _vllm_ascend_available = _is_package_available("vllm_ascend")
 _weave_available = _is_package_available("weave")
+_cce_available = _is_package_available("cut_cross_entropy")
 
 
 def is_deepspeed_available() -> bool:
@@ -159,6 +160,11 @@ def is_vllm_ascend_available() -> bool:
 
 def is_weave_available() -> bool:
     return _weave_available
+
+
+def is_cce_available() -> bool:
+    return _cce_available
+
 
 class _LazyModule(ModuleType):
     """

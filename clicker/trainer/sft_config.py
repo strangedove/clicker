@@ -64,6 +64,14 @@ class SFTConfig(TrainingArguments):
         max_length (`int` or `None`, *optional*, defaults to `1024`):
             Maximum length of the tokenized sequence. Sequences longer than `max_length` are truncated from the right.
             If `None`, no truncation is applied. When packing is enabled, this value sets the sequence length.
+        truncation_strategy (`str`, *optional*, defaults to `"truncate"`):
+            How to handle samples exceeding max_length:
+            - `"truncate"`: Cut off at max_length, no EOS on truncated samples (default)
+            - `"drop"`: Filter out samples exceeding max_length
+            - `"split"`: Split into multiple samples (text/CPT data only). First chunk gets BOS, last gets EOS.
+            - `"truncate_turns"`: For conversational data, drop complete turn pairs from start while preserving
+              system message. If even one turn exceeds max_length, the sample is dropped.
+            Per-dataset `truncation_strategy` in the dataset mixer overrides this global default.
         packing (`bool`, *optional*, defaults to `False`):
             Whether to group multiple sequences into fixed-length blocks to improve computational efficiency and reduce
             padding. Uses `max_length` to define sequence length.
@@ -92,6 +100,24 @@ class SFTConfig(TrainingArguments):
             Whether to compute loss only on the assistant part of the sequence. If set to `True`, loss is computed only
             on the assistant responses, which is supported only for [conversational](#conversational) datasets. If
             `False`, loss is computed on the entire sequence.
+        last_assistant_only_loss (`bool`, *optional*, defaults to `False`):
+            Whether to compute loss only on the LAST assistant turn in multi-turn conversations. When `True`, only the
+            final assistant response contributes to loss; intermediate assistant turns are masked. Implies
+            `assistant_only_loss=True`. Useful for teaching specific final behaviors without affecting intermediate
+            dialogue patterns.
+        train_on_incomplete_assistant (`bool`, *optional*, defaults to `False`):
+            Whether to train on incomplete/truncated assistant responses without adding EOS token. When `True`, if the
+            last message is from the assistant, the EOS token is not appended, treating it as a continuation rather
+            than a complete response. This prevents the model from learning to stop mid-thought on truncated data.
+        fix_turn_order (`bool`, *optional*, defaults to `False`):
+            Whether to fix conversation turn order for models with strict requirements (e.g., Llama). When `True`:
+            (1) adds a filler user message if conversation starts with assistant, (2) merges consecutive messages
+            from the same role, (3) drops trailing user messages so conversations end with assistant.
+        fix_turn_order_filler (`str`, *optional*, defaults to `"Let's begin."`):
+            The filler message to insert when `fix_turn_order=True` and the conversation starts with an assistant turn.
+        default_system_message (`str`, *optional*):
+            Default system message to add to conversations that don't have one. When using the dataset mixer,
+            per-dataset `system_message` overrides this global default. If `None`, no system message is added.
         loss_type (`str`, *optional*, defaults to `"nll"`):
             Type of loss to use. Possible values are `"nll"` (negative log-likelihood, default) and `"dft"` (Dynamic
             Fine-Tuning, as described in [this paper](https://huggingface.co/papers/2508.05629)).
@@ -187,6 +213,19 @@ class SFTConfig(TrainingArguments):
             "sequence length."
         },
     )
+    truncation_strategy: str = field(
+        default="truncate",
+        metadata={
+            "help": (
+                "How to handle samples exceeding max_length. Options: "
+                "'truncate' (cut off, no EOS on truncated), "
+                "'drop' (filter out), "
+                "'split' (chunk text data, first gets BOS, last gets EOS), "
+                "'truncate_turns' (conversational: drop turn pairs from start, keep system message)."
+            ),
+            "choices": ["truncate", "drop", "split", "truncate_turns"],
+        },
+    )
     packing: bool = field(
         default=False,
         metadata={
@@ -243,6 +282,59 @@ class SFTConfig(TrainingArguments):
             )
         },
     )
+    last_assistant_only_loss: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to compute loss only on the LAST assistant turn in multi-turn conversations. "
+                "When `True`, only the final assistant response contributes to loss; intermediate assistant turns are masked. "
+                "Implies `assistant_only_loss=True`. Useful for teaching specific final behaviors without affecting "
+                "intermediate dialogue patterns."
+            )
+        },
+    )
+    train_on_incomplete_assistant: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to train on incomplete/truncated assistant responses without adding EOS token. "
+                "When `True`, if the last message is from the assistant and appears truncated (no proper ending), "
+                "the EOS token is not appended, treating it as a continuation rather than a complete response. "
+                "This prevents the model from learning to stop mid-thought on truncated training data."
+            )
+        },
+    )
+    fix_turn_order: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to fix conversation turn order for models with strict requirements. "
+                "When `True`: (1) adds a filler user message if conversation starts with assistant, "
+                "(2) merges consecutive messages from the same role, "
+                "(3) drops trailing user messages so conversations end with assistant. "
+                "Use `fix_turn_order_filler` to customize the filler message."
+            )
+        },
+    )
+    fix_turn_order_filler: str = field(
+        default="Let's begin.",
+        metadata={
+            "help": (
+                "The filler message to insert when `fix_turn_order=True` and the conversation "
+                "starts with an assistant turn (no initial user message). Default: 'Let's begin.'"
+            )
+        },
+    )
+    default_system_message: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Default system message to add to conversations that don't have one. "
+                "When using the dataset mixer, per-dataset `system_message` overrides this global default. "
+                "If `None`, no system message is added."
+            )
+        },
+    )
     loss_type: str = field(
         default="nll",
         metadata={
@@ -256,7 +348,46 @@ class SFTConfig(TrainingArguments):
         default=False,
         metadata={"help": "Whether to offload the activations to the CPU."},
     )
+    use_cce: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use Cut Cross-Entropy (CCE) for memory-efficient cross-entropy loss computation. "
+            "Requires: pip install cut-cross-entropy"
+        },
+    )
+
+    # Prepared dataset support
+    prepared_dataset: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to a prepared dataset directory (created by `clicker blend`). "
+            "When specified, the dataset is loaded from this path instead of being loaded/processed at runtime. "
+            "The prepared dataset will be tokenized for the model and cached for faster subsequent runs."
+        },
+    )
+    tokenized_cache_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Directory to cache tokenized datasets. If not specified, caches are stored in "
+            "{prepared_dataset}/.tokenized_cache. Only used when `prepared_dataset` is specified."
+        },
+    )
+    force_retokenize: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, ignore cached tokenized datasets and re-tokenize from the prepared dataset."
+        },
+    )
 
     def __post_init__(self):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
+
+        # Validate truncation_strategy
+        valid_strategies = {"truncate", "drop", "split", "truncate_turns"}
+        if self.truncation_strategy not in valid_strategies:
+            raise ValueError(
+                f"Invalid truncation_strategy: {self.truncation_strategy}. "
+                f"Must be one of: {', '.join(sorted(valid_strategies))}"
+            )
+
         super().__post_init__()

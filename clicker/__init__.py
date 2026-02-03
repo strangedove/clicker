@@ -22,7 +22,7 @@ from .import_utils import _LazyModule
 __version__ = '1!0.1.0.dev0'
 
 _import_structure = {
-    "scripts": ["DatasetMixtureConfig", "ScriptArguments", "TrlParser", "get_dataset", "init_zero_verbose"],
+    "scripts": ["DataPrepConfig", "DatasetMixtureConfig", "ScriptArguments", "TrlParser", "get_dataset", "init_zero_verbose"],
     "data_utils": [
         "apply_chat_template",
         "extract_prompt",
@@ -111,7 +111,7 @@ if TYPE_CHECKING:
         create_reference_model,
         setup_chat_format,
     )
-    from .scripts import DatasetMixtureConfig, ScriptArguments, TrlParser, get_dataset, init_zero_verbose
+    from .scripts import DataPrepConfig, DatasetMixtureConfig, ScriptArguments, TrlParser, get_dataset, init_zero_verbose
     from .trainer import (
         AllTrueJudge,
         BaseBinaryJudge,

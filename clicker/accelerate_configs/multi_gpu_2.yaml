@@ -1,9 +1,3 @@
-# Multi-GPU DDP config (no FSDP)
-# Simple data parallel training across GPUs
-#
-# Good for: Smaller models that fit on each GPU
-# Usage: clicker train --config my_config.yaml --accelerate_config multi_gpu
-
 compute_environment: LOCAL_MACHINE
 debug: false
 distributed_type: MULTI_GPU
@@ -11,7 +5,7 @@ downcast_bf16: 'no'
 gpu_ids: all
 machine_rank: 0
 main_training_function: main
-mixed_precision: bf16
+mixed_precision: 'bf16'
 num_machines: 1
 num_processes: 2
 rdzv_backend: static

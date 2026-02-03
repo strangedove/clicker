@@ -1,25 +1,44 @@
+# FSDP v1 config - SHARD_GRAD_OP strategy (less aggressive sharding)
+# Auto-detects transformer layer class from model._no_split_modules
+#
+# Good for: Models that fit in GPU memory, faster than FULL_SHARD
+# Usage: clicker train --config my_config.yaml --accelerate_config fsdp1
+
 compute_environment: LOCAL_MACHINE
 debug: false
 distributed_type: FSDP
 downcast_bf16: 'no'
 enable_cpu_affinity: false
 fsdp_config:
-  fsdp_activation_checkpointing: false
+  # Auto-wrap policy - uses model._no_split_modules automatically
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
-  fsdp_backward_prefetch: BACKWARD_PRE
-  fsdp_cpu_ram_efficient_loading: true
-  fsdp_forward_prefetch: true
+
+  # SHARD_GRAD_OP only shards gradients and optimizer states
+  fsdp_sharding_strategy: SHARD_GRAD_OP
+
+  # No CPU offload for speed
   fsdp_offload_params: false
-  fsdp_reshard_after_forward: FULL_SHARD
-  fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_cpu_ram_efficient_loading: true
+
+  # Activation checkpointing disabled by default (enable in training config if needed)
+  fsdp_activation_checkpointing: false
+
+  # Performance optimizations
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_forward_prefetch: true
+
+  # Sync and state management
   fsdp_sync_module_states: true
   fsdp_use_orig_params: true
-  fsdp_version: 1
+
+  # State dict type
+  fsdp_state_dict_type: FULL_STATE_DICT
+
 machine_rank: 0
 main_training_function: main
 mixed_precision: bf16
 num_machines: 1
-num_processes: 8
+num_processes: 2
 rdzv_backend: static
 same_network: true
 tpu_env: []

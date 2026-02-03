@@ -77,6 +77,27 @@ class DatasetConfig:
             Which split of the data to load.
         columns (`list[str]`, *optional*):
             List of column names to select from the dataset. If `None`, all columns are selected.
+        system_message (`str`, *optional*):
+            System message to add to conversations that don't have one. This per-dataset setting overrides
+            the global `default_system_message` in the trainer config.
+        truncation_strategy (`str`, *optional*):
+            How to handle samples exceeding max_length. Options:
+            - `"truncate"`: Cut off at max_length (default behavior)
+            - `"drop"`: Filter out samples exceeding max_length
+            - `"split"`: Split into chunks (text/CPT data only)
+            - `"truncate_turns"`: Drop complete turn pairs from start, keep system message (conversational only)
+            This per-dataset setting overrides the global `truncation_strategy` in the trainer config.
+        subset (`int` or `float`, *optional*):
+            Number of samples (if int) or fraction (if float 0-1) to take from this dataset.
+            Applied after shuffling if `shuffle` is True.
+        shuffle (`bool`, *optional*):
+            Whether to shuffle this dataset before subsetting. If `None`, uses the global `shuffle_datasets` setting.
+        eval_split (`float` or `False`, *optional*):
+            Fraction of samples to split off for evaluation (0-1), or `False` to exclude this dataset from eval.
+            If `None`, uses the global `eval_split` setting.
+        eval_before_subset (`bool`, *optional*):
+            Whether to split off eval data before applying subset. If `None`, uses the global setting.
+            When `True`, eval is representative of full dataset. When `False` (default), eval size scales with subset.
     """
 
     path: str
@@ -85,6 +106,12 @@ class DatasetConfig:
     data_files: Optional[Union[str, list[str], dict[str, str]]] = None
     split: str = "train"
     columns: Optional[list[str]] = None
+    system_message: Optional[str] = None
+    truncation_strategy: Optional[str] = None
+    subset: Optional[Union[int, float]] = None
+    shuffle: Optional[bool] = None
+    eval_split: Optional[Union[float, bool]] = None
+    eval_before_subset: Optional[bool] = None
 
 
 @dataclass
@@ -104,26 +131,44 @@ class DatasetMixtureConfig:
         test_split_size (`float`, *optional*):
             Size of the test split. Refer to the `test_size` parameter in the [`~datasets.train_test_split`] function
             for more details. If `None`, the dataset will not be split into train and test sets.
+            **Deprecated**: Use `eval_split` instead for more control over per-dataset splitting.
+        shuffle_datasets (`bool`, *optional*, defaults to `True`):
+            Whether to shuffle each dataset before subsetting. Can be overridden per-dataset.
+        shuffle_combined (`bool`, *optional*, defaults to `True`):
+            Whether to shuffle the final combined dataset after all datasets are processed.
+        eval_split (`float`, *optional*, defaults to `0.0`):
+            Default fraction of samples to split off for evaluation from each dataset (0-1).
+            Can be overridden per-dataset. Set to 0.0 to disable eval splitting.
+        eval_before_subset (`bool`, *optional*, defaults to `False`):
+            Whether to split off eval data before applying subset (globally).
+            When `True`, eval is representative of full dataset.
+            When `False` (default), eval size scales with subset.
+        shuffle_seed (`int`, *optional*, defaults to `42`):
+            Seed for all shuffle operations (dataset shuffling and combined shuffling).
+        split_seed (`int`, *optional*, defaults to `42`):
+            Seed for train/eval splits. Separate from shuffle_seed for reproducibility.
 
     Usage:
         When using the CLI, you can add the following section to your YAML config file:
 
         ```yaml
+        # Global data processing options
+        shuffle_datasets: true
+        shuffle_combined: true
+        eval_split: 0.05
+        eval_before_subset: false
+        shuffle_seed: 42
+        split_seed: 42
+
         datasets:
-          - path: ...
-            name: ...
-            data_dir: ...
-            data_files: ...
-            split: ...
-            columns: ...
-          - path: ...
-            name: ...
-            data_dir: ...
-            data_files: ...
-            split: ...
-            columns: ...
-        streaming: ...
-        test_split_size: ...
+          - path: dataset_a
+            subset: 500
+            shuffle: true
+            eval_split: 0.05
+          - path: dataset_b
+            subset: 0.15
+            shuffle: false
+            eval_split: false
         ```
     """
 
@@ -139,8 +184,39 @@ class DatasetMixtureConfig:
         default=None,
         metadata={
             "help": "Size of the test split. Refer to the `test_size` parameter in the `datasets.train_test_split` "
-            "function for more details. If None, the dataset will not be split into train and test sets."
+            "function for more details. If None, the dataset will not be split into train and test sets. "
+            "Deprecated: Use `eval_split` instead for more control over per-dataset splitting."
         },
+    )
+    shuffle_datasets: bool = field(
+        default=True,
+        metadata={"help": "Whether to shuffle each dataset before subsetting. Can be overridden per-dataset."},
+    )
+    shuffle_combined: bool = field(
+        default=True,
+        metadata={"help": "Whether to shuffle the final combined dataset after all datasets are processed."},
+    )
+    eval_split: float = field(
+        default=0.0,
+        metadata={
+            "help": "Default fraction of samples to split off for evaluation from each dataset (0-1). "
+            "Can be overridden per-dataset. Set to 0.0 to disable eval splitting."
+        },
+    )
+    eval_before_subset: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to split off eval data before applying subset. "
+            "When True, eval is representative of full dataset. When False (default), eval size scales with subset."
+        },
+    )
+    shuffle_seed: int = field(
+        default=42,
+        metadata={"help": "Seed for all shuffle operations (dataset shuffling and combined shuffling)."},
+    )
+    split_seed: int = field(
+        default=42,
+        metadata={"help": "Seed for train/eval splits. Separate from shuffle_seed for reproducibility."},
     )
 
     def __post_init__(self):
@@ -149,6 +225,140 @@ class DatasetMixtureConfig:
             if isinstance(dataset, dict):
                 # If it's a dict, convert it to DatasetConfig
                 self.datasets[idx] = DatasetConfig(**dataset)
+
+
+@dataclass
+class DataPrepConfig(DatasetMixtureConfig):
+    """
+    Configuration for dataset preparation/blending.
+
+    Extends DatasetMixtureConfig with additional options for preprocessing datasets
+    in a model-agnostic way. The prepared dataset can then be tokenized for different
+    models at training time.
+
+    Parameters:
+        trainer_type (`str`, *optional*, defaults to `"sft"`):
+            Type of trainer this dataset is prepared for. Determines output format:
+            - `"sft"`: Output has `messages` column (or `text` for non-conversational)
+            - `"dpo"`, `"orpo"`: Output has `chosen` and `rejected` message columns
+            - `"kto"`: Output has `completion` and `label` columns
+        output_dir (`str`, *optional*):
+            Directory to save the prepared dataset. If not specified, must be provided via CLI.
+
+        > Preprocessing options (stored as metadata, applied at training time)
+
+        default_system_message (`str`, *optional*):
+            Default system message to add to conversations that don't have one.
+        assistant_only_loss (`bool`, *optional*, defaults to `False`):
+            Whether to compute loss only on assistant turns. Stored as `_assistant_only_loss` metadata.
+        last_assistant_only_loss (`bool`, *optional*, defaults to `False`):
+            Whether to compute loss only on the last assistant turn. Stored as `_last_assistant_only_loss` metadata.
+        train_on_incomplete_assistant (`bool`, *optional*, defaults to `False`):
+            Whether to train on incomplete assistant responses. Stored as `_train_on_incomplete_assistant` metadata.
+        fix_turn_order (`bool`, *optional*, defaults to `False`):
+            Whether to fix conversation turn order (add filler user message, merge consecutive roles, etc.).
+        fix_turn_order_filler (`str`, *optional*, defaults to `"Let's begin."`):
+            Filler message when conversation starts with assistant turn.
+        truncation_strategy (`str`, *optional*, defaults to `"truncate"`):
+            Default truncation strategy. Stored as `_truncation_strategy` metadata, applied at training time.
+        num_proc (`int`, *optional*):
+            Number of processes for dataset processing.
+
+    Example config file (`data/my_blend.yaml`):
+        ```yaml
+        trainer_type: sft
+        output_dir: data/my_blend_prepared
+
+        shuffle_datasets: true
+        shuffle_combined: true
+        eval_split: 0.05
+        shuffle_seed: 42
+        split_seed: 42
+
+        # Preprocessing options
+        assistant_only_loss: true
+        fix_turn_order: true
+        default_system_message: "You are a helpful assistant."
+        truncation_strategy: truncate
+
+        datasets:
+          - path: dataset-a
+            subset: 5000
+          - path: dataset-b
+            subset: 0.15
+            system_message: "You are a coding assistant."
+            truncation_strategy: drop
+        ```
+
+    CLI usage:
+        ```bash
+        clicker blend --config data/my_blend.yaml
+        # or specify output via CLI
+        clicker blend --config data/my_blend.yaml --output data/my_blend_prepared
+        ```
+    """
+
+    trainer_type: str = field(
+        default="sft",
+        metadata={
+            "help": "Type of trainer this dataset is prepared for: 'sft', 'dpo', 'orpo', 'kto'. "
+            "Determines output format."
+        },
+    )
+    output_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Directory to save the prepared dataset."},
+    )
+
+    # Preprocessing options (stored as metadata)
+    default_system_message: Optional[str] = field(
+        default=None,
+        metadata={"help": "Default system message to add to conversations that don't have one."},
+    )
+    assistant_only_loss: bool = field(
+        default=False,
+        metadata={"help": "Whether to compute loss only on assistant turns."},
+    )
+    last_assistant_only_loss: bool = field(
+        default=False,
+        metadata={"help": "Whether to compute loss only on the last assistant turn."},
+    )
+    train_on_incomplete_assistant: bool = field(
+        default=False,
+        metadata={"help": "Whether to train on incomplete/truncated assistant responses."},
+    )
+    fix_turn_order: bool = field(
+        default=False,
+        metadata={"help": "Whether to fix conversation turn order."},
+    )
+    fix_turn_order_filler: str = field(
+        default="Let's begin.",
+        metadata={"help": "Filler message when conversation starts with assistant turn."},
+    )
+    truncation_strategy: str = field(
+        default="truncate",
+        metadata={"help": "Default truncation strategy: 'truncate', 'drop', 'split', 'truncate_turns'."},
+    )
+    num_proc: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of processes for dataset processing."},
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Validate trainer_type
+        valid_trainer_types = {"sft", "dpo", "orpo", "kto"}
+        if self.trainer_type not in valid_trainer_types:
+            raise ValueError(
+                f"Invalid trainer_type: {self.trainer_type}. Must be one of: {', '.join(sorted(valid_trainer_types))}"
+            )
+        # Validate truncation_strategy
+        valid_strategies = {"truncate", "drop", "split", "truncate_turns"}
+        if self.truncation_strategy not in valid_strategies:
+            raise ValueError(
+                f"Invalid truncation_strategy: {self.truncation_strategy}. "
+                f"Must be one of: {', '.join(sorted(valid_strategies))}"
+            )
 
 
 @dataclass
@@ -417,9 +627,128 @@ def get_git_commit_hash(package_name):
         return f"Error: {str(e)}"
 
 
+def _apply_subset(dataset: datasets.Dataset, subset: Optional[Union[int, float]], seed: int) -> datasets.Dataset:
+    """Apply subset selection to a dataset."""
+    if subset is None:
+        return dataset
+
+    dataset_len = len(dataset)
+    if isinstance(subset, float):
+        if not 0 < subset <= 1:
+            raise ValueError(f"Subset fraction must be between 0 and 1, got {subset}")
+        n_samples = int(dataset_len * subset)
+    else:
+        n_samples = min(subset, dataset_len)
+
+    if n_samples >= dataset_len:
+        return dataset
+
+    # Use select with indices to take the first n_samples (dataset should already be shuffled if needed)
+    return dataset.select(range(n_samples))
+
+
+def _process_single_dataset(
+    dataset_config: DatasetConfig,
+    mixture_config: DatasetMixtureConfig,
+) -> tuple[Optional[datasets.Dataset], Optional[datasets.Dataset]]:
+    """
+    Process a single dataset: load, shuffle, subset, and split eval.
+
+    Returns:
+        Tuple of (train_dataset, eval_dataset). Either can be None.
+    """
+    logger.info(f"Loading dataset for mixture: {dataset_config.path} (config name: {dataset_config.name})")
+    dataset = datasets.load_dataset(
+        path=dataset_config.path,
+        name=dataset_config.name,
+        data_dir=dataset_config.data_dir,
+        data_files=dataset_config.data_files,
+        split=dataset_config.split,
+        streaming=mixture_config.streaming,
+    )
+
+    # For streaming datasets, we can't do shuffle/subset/split operations
+    if mixture_config.streaming:
+        if dataset_config.columns is not None:
+            dataset = dataset.select_columns(dataset_config.columns)
+        return dataset, None
+
+    original_len = len(dataset)
+
+    # Select columns if specified
+    if dataset_config.columns is not None:
+        dataset = dataset.select_columns(dataset_config.columns)
+
+    # Add per-dataset metadata columns
+    if dataset_config.system_message is not None:
+        dataset = dataset.add_column("_system_message", [dataset_config.system_message] * len(dataset))
+    if dataset_config.truncation_strategy is not None:
+        dataset = dataset.add_column("_truncation_strategy", [dataset_config.truncation_strategy] * len(dataset))
+
+    # Resolve per-dataset settings with global defaults
+    should_shuffle = dataset_config.shuffle if dataset_config.shuffle is not None else mixture_config.shuffle_datasets
+    eval_split_value = dataset_config.eval_split if dataset_config.eval_split is not None else mixture_config.eval_split
+    eval_before_subset = (
+        dataset_config.eval_before_subset
+        if dataset_config.eval_before_subset is not None
+        else mixture_config.eval_before_subset
+    )
+
+    # Determine if we should do eval split
+    do_eval_split = eval_split_value is not False and eval_split_value > 0
+
+    # Step 1: Shuffle if requested
+    if should_shuffle:
+        dataset = dataset.shuffle(seed=mixture_config.shuffle_seed)
+        logger.info(f"  Shuffled dataset (seed={mixture_config.shuffle_seed})")
+
+    train_dataset = dataset
+    eval_dataset = None
+
+    # Step 2a: If eval_before_subset, split eval first
+    if do_eval_split and eval_before_subset:
+        split_result = train_dataset.train_test_split(test_size=eval_split_value, seed=mixture_config.split_seed)
+        train_dataset = split_result["train"]
+        eval_dataset = split_result["test"]
+        logger.info(
+            f"  Split eval before subset: {len(eval_dataset)} eval, {len(train_dataset)} remaining "
+            f"(eval_split={eval_split_value})"
+        )
+
+    # Step 3: Apply subset
+    if dataset_config.subset is not None:
+        before_len = len(train_dataset)
+        train_dataset = _apply_subset(train_dataset, dataset_config.subset, mixture_config.shuffle_seed)
+        logger.info(f"  Applied subset: {before_len} -> {len(train_dataset)} samples")
+
+    # Step 2b: If not eval_before_subset, split eval after subset
+    if do_eval_split and not eval_before_subset:
+        split_result = train_dataset.train_test_split(test_size=eval_split_value, seed=mixture_config.split_seed)
+        train_dataset = split_result["train"]
+        eval_dataset = split_result["test"]
+        logger.info(
+            f"  Split eval after subset: {len(eval_dataset)} eval, {len(train_dataset)} train "
+            f"(eval_split={eval_split_value})"
+        )
+
+    logger.info(
+        f"  Final: {original_len} original -> {len(train_dataset)} train"
+        + (f", {len(eval_dataset)} eval" if eval_dataset else "")
+    )
+
+    return train_dataset, eval_dataset
+
+
 def get_dataset(mixture_config: DatasetMixtureConfig) -> DatasetDict:
     """
     Load a mixture of datasets based on the configuration.
+
+    This function handles:
+    - Per-dataset shuffling (controlled by `shuffle` or global `shuffle_datasets`)
+    - Per-dataset subsetting (controlled by `subset` - int for count, float for fraction)
+    - Per-dataset eval splitting (controlled by `eval_split` or global `eval_split`)
+    - Eval split timing (controlled by `eval_before_subset`)
+    - Final combined dataset shuffling (controlled by `shuffle_combined`)
 
     Args:
         mixture_config (`DatasetMixtureConfig`):
@@ -427,15 +756,19 @@ def get_dataset(mixture_config: DatasetMixtureConfig) -> DatasetDict:
 
     Returns:
         `DatasetDict`:
-            Combined dataset(s) from the mixture configuration, with optional train/test split if `test_split_size` is
-            set.
+            Combined dataset(s) from the mixture configuration. Contains "train" split and optionally
+            "test" split if eval_split > 0 or test_split_size is set.
 
     Example:
     ```python
     from trl import DatasetMixtureConfig, get_dataset
     from trl.scripts.utils import DatasetConfig
 
-    mixture_config = DatasetMixtureConfig(datasets=[DatasetConfig(path="trl-lib/tldr")])
+    mixture_config = DatasetMixtureConfig(
+        datasets=[DatasetConfig(path="trl-lib/tldr", subset=1000)],
+        shuffle_datasets=True,
+        eval_split=0.05,
+    )
     dataset = get_dataset(mixture_config)
     print(dataset)
     ```
@@ -444,37 +777,215 @@ def get_dataset(mixture_config: DatasetMixtureConfig) -> DatasetDict:
     DatasetDict({
         train: Dataset({
             features: ['prompt', 'completion'],
-            num_rows: 116722
+            num_rows: 950
+        })
+        test: Dataset({
+            features: ['prompt', 'completion'],
+            num_rows: 50
         })
     })
     ```
     """
     logger.info(f"Creating dataset mixture with {len(mixture_config.datasets)} datasets")
-    datasets_list = []
+    logger.info(
+        f"  Global settings: shuffle_datasets={mixture_config.shuffle_datasets}, "
+        f"shuffle_combined={mixture_config.shuffle_combined}, eval_split={mixture_config.eval_split}, "
+        f"eval_before_subset={mixture_config.eval_before_subset}"
+    )
+
+    train_datasets = []
+    eval_datasets = []
+
     for dataset_config in mixture_config.datasets:
-        logger.info(f"Loading dataset for mixture: {dataset_config.path} (config name: {dataset_config.name})")
-        dataset = datasets.load_dataset(
-            path=dataset_config.path,
-            name=dataset_config.name,
-            data_dir=dataset_config.data_dir,
-            data_files=dataset_config.data_files,
-            split=dataset_config.split,
-            streaming=mixture_config.streaming,
-        )
-        if dataset_config.columns is not None:
-            dataset = dataset.select_columns(dataset_config.columns)
-        datasets_list.append(dataset)
+        train_ds, eval_ds = _process_single_dataset(dataset_config, mixture_config)
+        if train_ds is not None:
+            train_datasets.append(train_ds)
+        if eval_ds is not None:
+            eval_datasets.append(eval_ds)
 
-    if datasets_list:
-        combined_dataset = concatenate_datasets(datasets_list)
-        if isinstance(combined_dataset, datasets.Dataset):  # IterableDataset does not have a length
-            logger.info(f"Created dataset mixture with {len(combined_dataset)} examples")
-
-        if mixture_config.test_split_size is not None:
-            logger.info(f"Splitting dataset into train and test sets with test size: {mixture_config.test_split_size}")
-            combined_dataset = combined_dataset.train_test_split(test_size=mixture_config.test_split_size)
-            return combined_dataset
-        else:
-            return DatasetDict({"train": combined_dataset})
-    else:
+    if not train_datasets:
         raise ValueError("No datasets were loaded from the mixture configuration")
+
+    # Combine train datasets
+    combined_train = concatenate_datasets(train_datasets)
+    if isinstance(combined_train, datasets.Dataset):
+        logger.info(f"Combined train dataset: {len(combined_train)} examples")
+
+    # Combine eval datasets if any
+    combined_eval = None
+    if eval_datasets:
+        combined_eval = concatenate_datasets(eval_datasets)
+        if isinstance(combined_eval, datasets.Dataset):
+            logger.info(f"Combined eval dataset: {len(combined_eval)} examples")
+
+    # Shuffle combined datasets if requested
+    if mixture_config.shuffle_combined and not mixture_config.streaming:
+        combined_train = combined_train.shuffle(seed=mixture_config.shuffle_seed)
+        logger.info(f"Shuffled combined train dataset (seed={mixture_config.shuffle_seed})")
+        if combined_eval is not None:
+            combined_eval = combined_eval.shuffle(seed=mixture_config.shuffle_seed)
+            logger.info(f"Shuffled combined eval dataset (seed={mixture_config.shuffle_seed})")
+
+    # Handle legacy test_split_size (deprecated but still supported)
+    if mixture_config.test_split_size is not None and combined_eval is None:
+        logger.warning(
+            "test_split_size is deprecated. Use eval_split instead for per-dataset control. "
+            "Falling back to legacy behavior."
+        )
+        split_result = combined_train.train_test_split(
+            test_size=mixture_config.test_split_size, seed=mixture_config.split_seed
+        )
+        return split_result
+
+    # Build result
+    if combined_eval is not None:
+        return DatasetDict({"train": combined_train, "test": combined_eval})
+    else:
+        return DatasetDict({"train": combined_train})
+
+
+def load_prepared_dataset(prepared_path: str) -> DatasetDict:
+    """
+    Load a prepared dataset from disk.
+
+    Args:
+        prepared_path: Path to the prepared dataset directory (created by `clicker blend`).
+            Should contain train.parquet, optionally test.parquet, and blend_metadata.json.
+
+    Returns:
+        DatasetDict with train and optionally test splits.
+    """
+    import os
+
+    if not os.path.isdir(prepared_path):
+        raise ValueError(f"Prepared dataset path does not exist: {prepared_path}")
+
+    result = {}
+
+    # Load train split
+    train_path = os.path.join(prepared_path, "train.parquet")
+    if os.path.exists(train_path):
+        result["train"] = datasets.Dataset.from_parquet(train_path)
+        logger.info(f"Loaded train split from {train_path}: {len(result['train'])} examples")
+    else:
+        raise ValueError(f"Train split not found at {train_path}")
+
+    # Load test split if exists
+    test_path = os.path.join(prepared_path, "test.parquet")
+    if os.path.exists(test_path):
+        result["test"] = datasets.Dataset.from_parquet(test_path)
+        logger.info(f"Loaded test split from {test_path}: {len(result['test'])} examples")
+
+    return DatasetDict(result)
+
+
+def get_tokenized_cache_path(
+    prepared_path: str,
+    model_name_or_path: str,
+    max_length: int,
+    cache_dir: Optional[str] = None,
+) -> str:
+    """
+    Compute the cache path for a tokenized dataset.
+
+    The cache key is based on:
+    - The prepared dataset's config hash (from blend_metadata.json)
+    - The model name/path
+    - The max_length
+
+    Args:
+        prepared_path: Path to the prepared dataset directory.
+        model_name_or_path: Model identifier.
+        max_length: Maximum sequence length.
+        cache_dir: Optional cache directory. If None, uses {prepared_path}/.tokenized_cache
+
+    Returns:
+        Path to the cache directory for this configuration.
+    """
+    import hashlib
+    import json
+    import os
+
+    # Load the blend metadata to get config hash
+    metadata_path = os.path.join(prepared_path, "blend_metadata.json")
+    if os.path.exists(metadata_path):
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+        blend_hash = metadata.get("config_hash", "unknown")
+    else:
+        # Fallback: hash the prepared path
+        blend_hash = hashlib.sha256(prepared_path.encode()).hexdigest()[:16]
+
+    # Create a cache key from model + max_length
+    cache_key_str = f"{model_name_or_path}|{max_length}"
+    cache_key = hashlib.sha256(cache_key_str.encode()).hexdigest()[:12]
+
+    # Determine cache directory
+    if cache_dir is None:
+        cache_dir = os.path.join(prepared_path, ".tokenized_cache")
+
+    cache_path = os.path.join(cache_dir, f"{blend_hash}_{cache_key}")
+    return cache_path
+
+
+def load_or_tokenize_dataset(
+    prepared_path: str,
+    tokenize_fn,
+    model_name_or_path: str,
+    max_length: int,
+    cache_dir: Optional[str] = None,
+    num_proc: Optional[int] = None,
+    force_retokenize: bool = False,
+) -> DatasetDict:
+    """
+    Load a tokenized dataset from cache, or tokenize and cache it.
+
+    Args:
+        prepared_path: Path to the prepared dataset directory.
+        tokenize_fn: Function to tokenize examples. Should take a dataset and return a tokenized dataset.
+        model_name_or_path: Model identifier (for cache key).
+        max_length: Maximum sequence length (for cache key).
+        cache_dir: Optional cache directory.
+        num_proc: Number of processes for tokenization.
+        force_retokenize: If True, ignore cache and re-tokenize.
+
+    Returns:
+        Tokenized DatasetDict.
+    """
+    import os
+
+    cache_path = get_tokenized_cache_path(prepared_path, model_name_or_path, max_length, cache_dir)
+
+    # Check if cached version exists
+    if not force_retokenize and os.path.isdir(cache_path):
+        train_cache = os.path.join(cache_path, "train.parquet")
+        if os.path.exists(train_cache):
+            logger.info(f"Loading tokenized dataset from cache: {cache_path}")
+            result = {}
+            result["train"] = datasets.Dataset.from_parquet(train_cache)
+            test_cache = os.path.join(cache_path, "test.parquet")
+            if os.path.exists(test_cache):
+                result["test"] = datasets.Dataset.from_parquet(test_cache)
+            return DatasetDict(result)
+
+    # Load prepared dataset
+    logger.info(f"Tokenizing prepared dataset from {prepared_path}")
+    dataset_dict = load_prepared_dataset(prepared_path)
+
+    # Tokenize
+    tokenized_dict = {}
+    for split_name, dataset in dataset_dict.items():
+        logger.info(f"Tokenizing {split_name} split ({len(dataset)} examples)")
+        tokenized = tokenize_fn(dataset)
+        tokenized_dict[split_name] = tokenized
+
+    result = DatasetDict(tokenized_dict)
+
+    # Cache the result
+    os.makedirs(cache_path, exist_ok=True)
+    for split_name, dataset in result.items():
+        split_path = os.path.join(cache_path, f"{split_name}.parquet")
+        dataset.to_parquet(split_path)
+        logger.info(f"Cached {split_name} split to {split_path}")
+
+    return result
