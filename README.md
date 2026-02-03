@@ -676,6 +676,66 @@ This is useful when:
 
 **Note:** `columns` **selects** columns, it doesn't rename them. Your dataset must already use the expected column names (`messages`, `prompt`, `chosen`, `rejected`, `completion`, `label`, `text`).
 
+### Per-File Configuration
+
+When you have multiple files in a single HuggingFace repo that need different processing (e.g., some conversational, some text), use per-file configuration instead of creating separate dataset entries:
+
+```yaml
+datasets:
+  - path: myorg/mixed-data-repo
+    data_files:
+      - file: conversations.parquet
+        truncation_strategy: truncate_turns
+        system_message: "You are a helpful assistant."
+      - file: text_corpus.parquet
+        columns: [text]
+        truncation_strategy: split
+      - file: preference_data.parquet
+        truncation_strategy: drop
+        subset: 5000
+    # Default settings for files that don't specify their own
+    subset: 10000
+    eval_split: 0.05
+```
+
+This is equivalent to (but much cleaner than):
+
+```yaml
+datasets:
+  - path: myorg/mixed-data-repo
+    data_files: conversations.parquet
+    truncation_strategy: truncate_turns
+    system_message: "You are a helpful assistant."
+    subset: 10000
+    eval_split: 0.05
+  - path: myorg/mixed-data-repo
+    data_files: text_corpus.parquet
+    columns: [text]
+    truncation_strategy: split
+    subset: 10000
+    eval_split: 0.05
+  - path: myorg/mixed-data-repo
+    data_files: preference_data.parquet
+    truncation_strategy: drop
+    subset: 5000
+    eval_split: 0.05
+```
+
+**Per-file options:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `file` | str | **Required.** Path to the file within the dataset |
+| `columns` | list | Columns to select (overrides dataset-level) |
+| `system_message` | str | System message for this file |
+| `truncation_strategy` | str | Truncation strategy for this file |
+| `subset` | int/float | Subset size for this file |
+| `shuffle` | bool | Whether to shuffle this file |
+| `eval_split` | float/false | Eval split for this file |
+| `eval_before_subset` | bool | When to split eval for this file |
+
+Each file is loaded and processed separately, so you can mix conversational and text data in the same repo without errors.
+
 ### Shuffle, Subset, and Eval Split
 
 Clicker provides fine-grained control over dataset shuffling, subsampling, and evaluation splitting.

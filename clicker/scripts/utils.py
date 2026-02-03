@@ -55,6 +55,43 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class FileConfig:
+    """
+    Configuration for a single file within a dataset repository.
+
+    Use this when you have multiple files in a single HuggingFace repo that need different
+    processing settings (e.g., some are conversational, some are text).
+
+    Parameters:
+        file (`str`):
+            Path to the file within the dataset (e.g., "conversations.parquet", "text/*.jsonl").
+        columns (`list[str]`, *optional*):
+            List of column names to select from this file.
+        system_message (`str`, *optional*):
+            System message to add to conversations in this file.
+        truncation_strategy (`str`, *optional*):
+            How to handle samples exceeding max_length for this file.
+        subset (`int` or `float`, *optional*):
+            Number of samples (if int) or fraction (if float 0-1) to take from this file.
+        shuffle (`bool`, *optional*):
+            Whether to shuffle this file before subsetting.
+        eval_split (`float` or `False`, *optional*):
+            Eval split fraction for this file, or `False` to exclude from eval.
+        eval_before_subset (`bool`, *optional*):
+            Whether to split eval before subsetting for this file.
+    """
+
+    file: str
+    columns: Optional[list[str]] = None
+    system_message: Optional[str] = None
+    truncation_strategy: Optional[str] = None
+    subset: Optional[Union[int, float]] = None
+    shuffle: Optional[bool] = None
+    eval_split: Optional[Union[float, bool]] = None
+    eval_before_subset: Optional[bool] = None
+
+
+@dataclass
 class DatasetConfig:
     """
     Configuration for a dataset.
@@ -71,8 +108,19 @@ class DatasetConfig:
             Defining the `data_dir` of the dataset configuration. If specified for the generic builders(csv, text etc.)
             or the Hub datasets and `data_files` is `None`, the behavior is equal to passing `os.path.join(data_dir,
             **)` as `data_files` to reference all the files in a directory.
-        data_files (`str` or `Sequence` or `Mapping`, *optional*):
-            Path(s) to source data file(s).
+        data_files (`str` or `Sequence` or `Mapping` or `list[FileConfig]`, *optional*):
+            Path(s) to source data file(s). Can be:
+            - A string: `"data.parquet"`
+            - A list of strings: `["file1.parquet", "file2.parquet"]`
+            - A list of FileConfig objects with per-file settings:
+              ```yaml
+              data_files:
+                - file: conversations.parquet
+                  truncation_strategy: truncate_turns
+                - file: text_data.parquet
+                  columns: [text]
+                  truncation_strategy: split
+              ```
         split (`str`, *optional*, defaults to `"train"`):
             Which split of the data to load.
         columns (`list[str]`, *optional*):
@@ -103,7 +151,7 @@ class DatasetConfig:
     path: str
     name: Optional[str] = None
     data_dir: Optional[str] = None
-    data_files: Optional[Union[str, list[str], dict[str, str]]] = None
+    data_files: Optional[Union[str, list, dict[str, str]]] = None
     split: str = "train"
     columns: Optional[list[str]] = None
     system_message: Optional[str] = None
@@ -221,10 +269,63 @@ class DatasetMixtureConfig:
 
     def __post_init__(self):
         # Convert any dataset dicts (from CLI/config parsing) into DatasetConfig objects
-        for idx, dataset in enumerate(self.datasets):
+        # and expand per-file configs into separate DatasetConfigs
+        expanded_datasets = []
+        for dataset in self.datasets:
             if isinstance(dataset, dict):
-                # If it's a dict, convert it to DatasetConfig
-                self.datasets[idx] = DatasetConfig(**dataset)
+                dataset = DatasetConfig(**dataset)
+
+            # Check if data_files contains FileConfig objects (per-file settings)
+            if dataset.data_files is not None and isinstance(dataset.data_files, list):
+                # Check if any item is a dict with 'file' key (FileConfig format)
+                has_file_configs = any(
+                    isinstance(item, dict) and "file" in item for item in dataset.data_files
+                )
+                if has_file_configs:
+                    # Expand into separate DatasetConfigs, one per file
+                    for file_item in dataset.data_files:
+                        if isinstance(file_item, dict) and "file" in file_item:
+                            # Create FileConfig then expand to DatasetConfig
+                            file_config = FileConfig(**file_item)
+                            # Create a new DatasetConfig with file-specific overrides
+                            expanded = DatasetConfig(
+                                path=dataset.path,
+                                name=dataset.name,
+                                data_dir=dataset.data_dir,
+                                data_files=file_config.file,
+                                split=dataset.split,
+                                # Per-file settings override dataset-level settings
+                                columns=file_config.columns if file_config.columns is not None else dataset.columns,
+                                system_message=file_config.system_message if file_config.system_message is not None else dataset.system_message,
+                                truncation_strategy=file_config.truncation_strategy if file_config.truncation_strategy is not None else dataset.truncation_strategy,
+                                subset=file_config.subset if file_config.subset is not None else dataset.subset,
+                                shuffle=file_config.shuffle if file_config.shuffle is not None else dataset.shuffle,
+                                eval_split=file_config.eval_split if file_config.eval_split is not None else dataset.eval_split,
+                                eval_before_subset=file_config.eval_before_subset if file_config.eval_before_subset is not None else dataset.eval_before_subset,
+                            )
+                            expanded_datasets.append(expanded)
+                        elif isinstance(file_item, str):
+                            # Plain string file path, use dataset-level settings
+                            expanded = DatasetConfig(
+                                path=dataset.path,
+                                name=dataset.name,
+                                data_dir=dataset.data_dir,
+                                data_files=file_item,
+                                split=dataset.split,
+                                columns=dataset.columns,
+                                system_message=dataset.system_message,
+                                truncation_strategy=dataset.truncation_strategy,
+                                subset=dataset.subset,
+                                shuffle=dataset.shuffle,
+                                eval_split=dataset.eval_split,
+                                eval_before_subset=dataset.eval_before_subset,
+                            )
+                            expanded_datasets.append(expanded)
+                    continue  # Don't add the original dataset
+
+            expanded_datasets.append(dataset)
+
+        self.datasets = expanded_datasets
 
 
 @dataclass
