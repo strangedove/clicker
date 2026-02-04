@@ -1,0 +1,81 @@
+# Sample Clicker Dataset Config
+# Converted from axolotl config: ToastyPigeon/some-configs/koto-glitter.yaml
+#
+# This demonstrates:
+# - Multiple datasets with different types (chat_template vs completion)
+# - Per-dataset subsets and eval splits
+# - Custom column mappings for non-standard formats
+# - Per-file configuration within a single HF repo
+
+# Global settings
+shuffle_datasets: true
+shuffle_combined: true
+shuffle_seed: 69
+split_seed: 69
+eval_split: 0.01  # 1% eval from each dataset
+
+datasets:
+  # Standard conversational dataset with custom field mapping
+  - path: allura-org/EU01-S2
+    type: conversational
+    columns:
+      - conversations
+    # axolotl used field_messages: conversations with role: from, content: value
+    # In clicker, you'd handle column renaming in your preprocessing or use
+    # a dataset that's already in standard format
+
+  # Dataset with subset - only use 10% of training data
+  - path: allenai/tulu-3-sft-personas-instruction-following
+    type: conversational
+    subset: 0.1  # 10% of the dataset
+    shuffle: true
+
+  # Per-file configuration within a single repo
+  - path: ToastyPigeon/mixed-medical-reasoning-formatted
+    type: conversational
+    files:
+      - file: mixed-medical-thinking.json
+        subset: 0.1  # 10% of this specific file
+
+  # Text completion dataset (not conversational)
+  - path: ToastyPigeon/steve-and-marvin
+    type: text
+    files:
+      - file: marvin.json
+
+  # Simple conversational dataset - use all data
+  - path: ToastyPigeon/kimi-stories-instruct
+    type: conversational
+
+  # Another text completion with per-file config
+  - path: ToastyPigeon/new-story-dataset
+    type: text
+    files:
+      - file: new-story-dataset-v2.json
+
+  # Conversational datasets with custom column mapping
+  # (assuming conversations column with from/value format)
+  - path: allura-org/fujin-instruct-v2
+    type: conversational
+    columns:
+      - conversations
+
+  - path: ToastyPigeon/some-rp-extended
+    type: conversational
+    columns:
+      - conversations
+    # Note: axolotl had roles_to_train: ["user","assistant"]
+    # In clicker, this would be handled by train_on_incomplete_assistant or similar
+
+  - path: ToastyPigeon/gutenberg-sft
+    type: conversational
+    columns:
+      - conversations
+
+  # Text completion datasets
+  - path: ToastyPigeon/SpringDragon
+    type: text
+
+  - path: ToastyPigeon/some-erotica
+    type: text
+    subset: 0.1  # 10% of this dataset
