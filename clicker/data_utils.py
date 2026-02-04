@@ -1592,3 +1592,218 @@ def expand_split_chunks(dataset: "Dataset") -> "Dataset":
     from datasets import Dataset as HFDataset
 
     return HFDataset.from_list(expanded_rows)
+
+
+# ---------------------------------------------------------------------------
+# Standalone tokenization and truncation functions
+# (Used by both clicker blend and SFTTrainer)
+# ---------------------------------------------------------------------------
+
+
+def mask_to_last_segment_only(mask: list[int]) -> list[int]:
+    """
+    Transform an assistant mask to only keep the last contiguous segment of 1s.
+
+    Used for ``last_assistant_only_loss`` where we only want to train on the
+    final assistant response in a multi-turn conversation.
+    """
+    if not mask or 1 not in mask:
+        return mask
+
+    result = [0] * len(mask)
+    last_one_idx = None
+    for i in range(len(mask) - 1, -1, -1):
+        if mask[i] == 1:
+            last_one_idx = i
+            break
+    if last_one_idx is None:
+        return result
+    start_idx = last_one_idx
+    while start_idx > 0 and mask[start_idx - 1] == 1:
+        start_idx -= 1
+    for i in range(start_idx, last_one_idx + 1):
+        result[i] = 1
+    return result
+
+
+def remove_trailing_eos(input_ids: list[int], eos_token_id: int) -> list[int]:
+    """Remove trailing EOS token(s) from *input_ids*."""
+    while input_ids and input_ids[-1] == eos_token_id:
+        input_ids = input_ids[:-1]
+    return input_ids
+
+
+def tokenize_sft_example(
+    example: dict,
+    processing_class,
+    dataset_text_field: str = "text",
+    assistant_only_loss: bool = False,
+    last_assistant_only_loss: bool = False,
+    train_on_incomplete_assistant: bool = False,
+    eos_token_id: Optional[int] = None,
+) -> dict:
+    """
+    Tokenize a single SFT example (conversational or plain text).
+
+    This is the standalone version of the tokenization logic that lives inside
+    ``SFTTrainer._prepare_dataset``.  It handles:
+
+    * Prompt-completion datasets (``prompt`` + ``completion`` columns)
+    * Conversational datasets (``messages`` column)
+    * Plain text datasets (``text`` or custom ``dataset_text_field``)
+
+    Returns a dict with at least ``input_ids`` and optionally
+    ``completion_mask`` and ``assistant_masks``.
+    """
+    need_assistant_masks = assistant_only_loss or last_assistant_only_loss
+
+    # Check if last message is from assistant (for train_on_incomplete_assistant)
+    last_role_is_assistant = False
+    if train_on_incomplete_assistant:
+        messages = example.get("messages") or (
+            example.get("prompt", []) + example.get("completion", [])
+        )
+        if messages and isinstance(messages, list) and len(messages) > 0:
+            last_msg = messages[-1]
+            if isinstance(last_msg, dict):
+                role = last_msg.get("role") or last_msg.get("from", "")
+                last_role_is_assistant = role.lower() in ("assistant", "gpt")
+
+    if "prompt" in example:  # prompt-completion case
+        output = {}
+        if is_conversational(example):
+            prompt_ids = processing_class.apply_chat_template(
+                example["prompt"],
+                tokenize=True,
+                add_generation_prompt=True,
+                tools=example.get("tools"),
+                **example.get("chat_template_kwargs", {}),
+            )
+            prompt_ids = prompt_ids[0] if isinstance(prompt_ids[0], list) else prompt_ids
+            prompt_completion_processed = processing_class.apply_chat_template(
+                example["prompt"] + example["completion"],
+                return_dict=True,
+                tokenize=True,
+                return_assistant_tokens_mask=need_assistant_masks,
+                tools=example.get("tools"),
+                **example.get("chat_template_kwargs", {}),
+            )
+            prompt_completion_processed = {
+                k: v[0] if isinstance(v[0], list) else v
+                for k, v in prompt_completion_processed.items()
+            }
+            prompt_completion_ids = prompt_completion_processed["input_ids"]
+            if "assistant_masks" in prompt_completion_processed:
+                output["assistant_masks"] = prompt_completion_processed["assistant_masks"]
+        else:
+            prompt_ids = processing_class(text=example["prompt"])["input_ids"]
+            prompt_completion_ids = processing_class(text=example["prompt"] + example["completion"])["input_ids"]
+
+        completion_mask = [0] * len(prompt_ids) + [1] * (len(prompt_completion_ids) - len(prompt_ids))
+        output["input_ids"] = prompt_completion_ids
+        output["completion_mask"] = completion_mask
+
+    else:  # language modeling case
+        if is_conversational(example):
+            processed = processing_class.apply_chat_template(
+                example["messages"],
+                return_dict=True,
+                tokenize=True,
+                return_assistant_tokens_mask=need_assistant_masks,
+                tools=example.get("tools"),
+                **example.get("chat_template_kwargs", {}),
+            )
+            processed = {k: v[0] if isinstance(v[0], list) else v for k, v in processed.items()}
+            output = {k: processed[k] for k in ("input_ids", "assistant_masks") if k in processed}
+        else:
+            output = {"input_ids": processing_class(text=example[dataset_text_field])["input_ids"]}
+
+    # Apply last_assistant_only_loss: mask all but the last assistant turn
+    if last_assistant_only_loss and "assistant_masks" in output:
+        output["assistant_masks"] = mask_to_last_segment_only(output["assistant_masks"])
+
+    # Apply train_on_incomplete_assistant: remove trailing EOS if last role is assistant
+    if train_on_incomplete_assistant and last_role_is_assistant and eos_token_id is not None:
+        output["input_ids"] = remove_trailing_eos(output["input_ids"], eos_token_id)
+        if "assistant_masks" in output:
+            output["assistant_masks"] = output["assistant_masks"][: len(output["input_ids"])]
+        if "completion_mask" in output:
+            output["completion_mask"] = output["completion_mask"][: len(output["input_ids"])]
+
+    return output
+
+
+def apply_truncation_to_dataset(
+    dataset: "Dataset",
+    processing_class,
+    max_length: int,
+    strategy: str = "truncate",
+    num_proc: Optional[int] = None,
+) -> "Dataset":
+    """
+    Apply a truncation strategy to a tokenized dataset.
+
+    Args:
+        dataset: HF Dataset with ``input_ids`` column.
+        processing_class: Tokenizer (used by split/truncate internals).
+        max_length: Maximum sequence length.
+        strategy: One of ``"truncate"``, ``"drop"``, ``"split"``.
+            (``"truncate_turns"`` should be applied *before* tokenization.)
+        num_proc: Number of processes for ``dataset.map``.
+
+    Returns:
+        Dataset with truncation applied.  For ``"split"``, chunks are expanded
+        into separate rows.
+    """
+    import logging as _logging
+
+    _logger = _logging.getLogger(__name__)
+
+    map_kwargs: dict = {}
+    if num_proc is not None:
+        map_kwargs["num_proc"] = num_proc
+
+    if strategy == "truncate_turns":
+        strategy = "truncate"  # already handled pre-tokenization
+
+    if strategy == "drop":
+        original_len = len(dataset)
+        dataset = dataset.filter(
+            lambda x: len(x.get("input_ids", [])) <= max_length,
+            num_proc=num_proc,
+        )
+        filtered_len = len(dataset)
+        if filtered_len < original_len:
+            _logger.info(
+                f"drop strategy: Filtered out {original_len - filtered_len} samples "
+                f"exceeding max_length={max_length}."
+            )
+
+    elif strategy == "split":
+        def _apply_split(example, tokenizer, _max_length):
+            return apply_truncation_strategy_to_example(
+                example, tokenizer, _max_length, strategy="split"
+            )
+
+        dataset = dataset.map(
+            _apply_split,
+            fn_kwargs={"tokenizer": processing_class, "_max_length": max_length},
+            desc="Splitting into chunks",
+            **map_kwargs,
+        )
+        dataset = expand_split_chunks(dataset)
+
+    else:  # "truncate"
+        def _apply_truncate(example, tokenizer, _max_length):
+            return apply_truncation_strategy_to_example(
+                example, tokenizer, _max_length, strategy="truncate"
+            )
+
+        dataset = dataset.map(
+            _apply_truncate,
+            fn_kwargs={"tokenizer": processing_class, "_max_length": max_length},
+            desc="Truncating",
+            **map_kwargs,
+        )
+
+    return dataset

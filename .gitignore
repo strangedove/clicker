@@ -147,3 +147,4 @@ wandb/
 # random stuff
 .claude
 .ruff_cache
+note-to-claude.txt

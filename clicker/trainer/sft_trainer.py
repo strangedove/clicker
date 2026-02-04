@@ -686,7 +686,8 @@ class SFTTrainer(BaseTrainer):
 
         # Processing class
         if processing_class is None:
-            processing_class = AutoProcessor.from_pretrained(model_id)
+            trust_remote_code = getattr(model.config, "auto_map", None) is not None
+            processing_class = AutoProcessor.from_pretrained(model_id, trust_remote_code=trust_remote_code)
 
         # Handle pad token for processors or tokenizers
         if isinstance(processing_class, ProcessorMixin):
@@ -1322,7 +1323,13 @@ class SFTTrainer(BaseTrainer):
                 )
 
             # Pack or truncate
-            if packing:
+            # Skip truncation for pre-tokenized blend data (already truncated/split)
+            _pretokenized = getattr(args, "_pretokenized", False)
+            if _pretokenized and is_processed and not packing:
+                logger.info(
+                    f"Skipping truncation for {dataset_name} — data is pre-tokenized from blend."
+                )
+            elif packing:
                 if args.max_length is None:
                     raise ValueError("When packing is enabled, `max_length` can't be `None`.")
                 if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
@@ -1528,6 +1535,44 @@ class SFTTrainer(BaseTrainer):
         logs.update(metrics)
         super().log(logs, start_time)
         self._metrics[mode].clear()
+
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+        """Override to handle PEFT + DeepSpeed ZeRO-3 saving.
+
+        The default Trainer.save_model() consolidates the entire ZeRO-3 sharded model
+        into a single state dict before saving, which OOMs for large models even when
+        only LoRA adapter weights need to be saved. This override detects the PEFT +
+        DeepSpeed case and gathers only the small trainable adapter parameters.
+        """
+        if output_dir is None:
+            output_dir = self.args.output_dir
+
+        is_peft = is_peft_available() and isinstance(
+            self.accelerator.unwrap_model(self.model, keep_torch_compile=False), PeftModel
+        )
+
+        if self.is_deepspeed_enabled and is_peft:
+            # Gather only trainable (adapter) parameters instead of the full model.
+            # Under ZeRO-3, all params are partitioned; we use GatheredParameters to
+            # temporarily materialize just the trainable ones on rank 0.
+            import deepspeed
+
+            unwrapped = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+            trainable_params = [p for p in unwrapped.parameters() if p.requires_grad]
+
+            with deepspeed.zero.GatheredParameters(trainable_params):
+                if self.args.should_save:
+                    unwrapped.save_pretrained(output_dir, safe_serialization=self.args.save_safetensors)
+
+            # Save tokenizer / processor on main process
+            if self.args.should_save:
+                if self.processing_class is not None:
+                    self.processing_class.save_pretrained(output_dir)
+
+            if self.args.push_to_hub and not _internal_call:
+                self.push_to_hub(commit_message="Model save", revision=self.args.hub_revision)
+        else:
+            super().save_model(output_dir, _internal_call)
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):

@@ -1,0 +1,10 @@
+# Marvin dataset (no anthologies) - model-agnostic data config
+# All 154 texts from the marvin_no_anthologies collection
+
+datasets:
+  - path: /tmp/marvin-dataset
+    split: train
+
+shuffle_datasets: true
+shuffle_combined: true
+shuffle_seed: 42

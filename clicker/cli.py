@@ -96,21 +96,8 @@ def main():
     if args.command == "blend":
         # Blend/preprocess datasets - doesn't need accelerate launch
         blend_parser = make_blend_parser()
-        config_args, remaining = blend_parser.parse_args_and_config(
-            args=sys.argv[2:], return_remaining_strings=True
-        )
-
-        # Handle --output override from remaining args
-        output_override = None
-        if "--output" in remaining:
-            idx = remaining.index("--output")
-            output_override = remaining[idx + 1]
-        elif "-o" in remaining:
-            idx = remaining.index("-o")
-            output_override = remaining[idx + 1]
-
-        config = config_args[0]
-        blend_main(config, output_override)
+        blend_args = blend_parser.parse_args(sys.argv[2:])
+        blend_main(blend_args.config, blend_args.output)
 
     elif args.command == "dpo":
         # Get the default args for the launch command

@@ -1,0 +1,20 @@
+# Test config for blend pipeline
+# Usage: python -m clicker.scripts.blend --config configs/test-blend-marvin.yaml --output /tmp/test-blend-output
+
+model_name_or_path: /home/aibox/.cache/huggingface/hub/models--IntervitensInc--Trinity-Mini-SCM/snapshots/b97dc84365203fbc786cc990ab90a59a786ecde5
+trust_remote_code: true
+
+# Data config (model-agnostic)
+data_config: data/marvin.yaml
+
+# Tokenization + truncation
+max_length: 4096
+truncation_strategy: split
+dataset_text_field: text
+
+# Eval split (applied AFTER tokenization + chunking)
+eval_split: 0.05
+split_seed: 42
+
+# Output for prepared dataset
+prepared_dataset: /tmp/test-blend-output

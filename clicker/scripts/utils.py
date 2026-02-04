@@ -980,6 +980,200 @@ def load_prepared_dataset(prepared_path: str) -> DatasetDict:
     return DatasetDict(result)
 
 
+def is_pretokenized_blend(prepared_path: str) -> bool:
+    """
+    Check if a prepared dataset was created by new-style blend (pre-tokenized).
+
+    Returns True if blend_metadata.json exists and has ``"tokenized": true``.
+    """
+    import json
+    import os
+
+    metadata_path = os.path.join(prepared_path, "blend_metadata.json")
+    if not os.path.exists(metadata_path):
+        return False
+    try:
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+        return metadata.get("tokenized", False)
+    except (json.JSONDecodeError, OSError):
+        return False
+
+
+def _load_blend_metadata(prepared_path: str) -> Optional[dict]:
+    """Load blend_metadata.json from a prepared dataset directory, or return None."""
+    import json
+    import os
+
+    metadata_path = os.path.join(prepared_path, "blend_metadata.json")
+    if not os.path.exists(metadata_path):
+        return None
+    try:
+        with open(metadata_path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def validate_blend_metadata(prepared_path: str, training_config: dict) -> list[str]:
+    """
+    Compare blend metadata against the current training config.
+
+    Returns a list of mismatch descriptions. Empty list means everything matches.
+    """
+    import os
+
+    metadata = _load_blend_metadata(prepared_path)
+    if metadata is None:
+        return ["No blend_metadata.json found — cannot verify dataset matches config."]
+
+    mismatches = []
+
+    # Fields to compare: (metadata_key, config_key, label)
+    checks = [
+        ("model_name_or_path", "model_name_or_path", "Model"),
+        ("max_length", "max_length", "Max length"),
+        ("truncation_strategy", "truncation_strategy", "Truncation strategy"),
+        ("data_config", "data_config", "Data config"),
+        ("dataset_text_field", "dataset_text_field", "Dataset text field"),
+    ]
+
+    for meta_key, config_key, label in checks:
+        meta_val = metadata.get(meta_key)
+        config_val = training_config.get(config_key)
+        if config_val is not None and meta_val is not None and str(meta_val) != str(config_val):
+            mismatches.append(f"  {label}: blend has '{meta_val}', config has '{config_val}'")
+
+    # Check eval_split separately (float comparison)
+    meta_eval = metadata.get("eval_split", 0.0)
+    config_eval = training_config.get("eval_split", 0.0)
+    if abs(float(meta_eval) - float(config_eval)) > 1e-6:
+        mismatches.append(f"  Eval split: blend has {meta_eval}, config has {config_eval}")
+
+    return mismatches
+
+
+def needs_blend(prepared_path: str) -> bool:
+    """Check if a prepared dataset path is missing, empty, or has no train.parquet."""
+    import os
+
+    if not prepared_path:
+        return True
+    if not os.path.isdir(prepared_path):
+        return True
+    train_path = os.path.join(prepared_path, "train.parquet")
+    return not os.path.exists(train_path)
+
+
+def build_blend_config(training_args, model_args) -> dict:
+    """
+    Build the config dict that blend.prepare_dataset() expects from SFT training args.
+    """
+    config = {
+        "model_name_or_path": model_args.model_name_or_path,
+        "trust_remote_code": model_args.trust_remote_code,
+        "data_config": training_args.data_config,
+        "max_length": training_args.max_length,
+        "truncation_strategy": getattr(training_args, "truncation_strategy", "truncate"),
+        "dataset_text_field": getattr(training_args, "dataset_text_field", "text"),
+        "eval_split": getattr(training_args, "eval_split", 0.0),
+        "split_seed": getattr(training_args, "split_seed", 42),
+        "prepared_dataset": training_args.prepared_dataset,
+    }
+
+    # Optional fields
+    for attr in [
+        "default_system_message", "fix_turn_order", "fix_turn_order_filler",
+        "assistant_only_loss", "last_assistant_only_loss",
+        "train_on_incomplete_assistant", "dataset_num_proc", "chat_template_path",
+    ]:
+        val = getattr(training_args, attr, None)
+        if val is not None:
+            config[attr] = val
+
+    return config
+
+
+def run_auto_blend(training_args, model_args) -> None:
+    """
+    Run the blend pipeline automatically from within sft.py.
+
+    Only the main process (LOCAL_RANK 0) runs the blend. Other processes wait
+    for the output directory to be populated.
+    """
+    import os
+    from clicker.scripts.blend import prepare_dataset, save_prepared_dataset
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    output_dir = training_args.prepared_dataset
+    metadata_path = os.path.join(output_dir, "blend_metadata.json")
+
+    if local_rank == 0:
+        # Delete metadata file first so other processes know we're re-blending
+        if os.path.exists(metadata_path):
+            os.remove(metadata_path)
+
+        blend_config = build_blend_config(training_args, model_args)
+        print(f"\n🔄 Auto-running blend to prepare dataset at {output_dir}...")
+        dataset_dict = prepare_dataset(blend_config)
+        save_prepared_dataset(dataset_dict, output_dir, blend_config)
+        print()
+
+    # Barrier: non-main processes wait for the output to exist
+    if local_rank != 0:
+        import time
+        train_path = os.path.join(output_dir, "train.parquet")
+        # Wait up to 30 minutes for main process to finish blending
+        for _ in range(1800):
+            if os.path.exists(train_path) and os.path.exists(metadata_path):
+                break
+            time.sleep(1)
+        else:
+            raise TimeoutError(
+                f"Waited 30 minutes for blend to complete at {output_dir} but it never finished."
+            )
+
+
+def prompt_blend_overwrite(prepared_path: str, mismatches: list[str]) -> bool:
+    """
+    Prompt user (on rank 0 only) whether to overwrite a mismatched prepared dataset.
+
+    Returns True if user wants to re-blend, False to abort.
+    In non-interactive environments, defaults to aborting with an error message.
+    """
+    import os
+    import sys
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if local_rank != 0:
+        # Non-main processes shouldn't prompt; they'll follow main's decision
+        return False
+
+    print("\n⚠️  Prepared dataset metadata does not match current training config:")
+    for m in mismatches:
+        print(m)
+    print(f"\n  Prepared dataset: {prepared_path}")
+    print()
+
+    # Check if we can prompt interactively
+    if not sys.stdin.isatty():
+        print(
+            "❌ Non-interactive environment — cannot prompt for confirmation.\n"
+            "   Run `clicker blend` manually, or delete the prepared dataset directory to auto-blend."
+        )
+        sys.exit(1)
+
+    while True:
+        response = input("Overwrite with re-blended data matching current config? [y/n]: ").strip().lower()
+        if response in ("y", "yes"):
+            return True
+        elif response in ("n", "no"):
+            print("❌ Aborting. Update your config's prepared_dataset path or run blend manually.")
+            sys.exit(1)
+        else:
+            print("  Please enter 'y' or 'n'.")
+
+
 def get_tokenized_cache_path(
     prepared_path: str,
     model_name_or_path: str,

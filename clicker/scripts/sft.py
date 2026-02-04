@@ -84,7 +84,16 @@ from clicker import (
     get_quantization_config,
 )
 from clicker.import_utils import is_cce_available
-from clicker.scripts.utils import load_prepared_dataset, get_tokenized_cache_path
+from clicker.scripts.utils import (
+    build_blend_config,
+    load_prepared_dataset,
+    get_tokenized_cache_path,
+    is_pretokenized_blend,
+    needs_blend,
+    prompt_blend_overwrite,
+    run_auto_blend,
+    validate_blend_metadata,
+)
 
 
 logger = logging.get_logger(__name__)
@@ -111,7 +120,10 @@ def main(script_args, training_args, model_args, dataset_args):
         model_kwargs["quantization_config"] = quantization_config
 
     # Create model
-    config = AutoConfig.from_pretrained(model_args.model_name_or_path)
+    config = AutoConfig.from_pretrained(
+        model_args.model_name_or_path,
+        trust_remote_code=model_args.trust_remote_code,
+    )
     valid_image_text_architectures = MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES.values()
 
     if config.architectures and any(arch in valid_image_text_architectures for arch in config.architectures):
@@ -141,12 +153,42 @@ def main(script_args, training_args, model_args, dataset_args):
 
     # Load the dataset
     if training_args.prepared_dataset:
-        # Load from prepared dataset (created by `clicker blend`)
-        logger.info(f"Loading prepared dataset from {training_args.prepared_dataset}")
-        dataset = load_prepared_dataset(training_args.prepared_dataset)
+        _prepared = training_args.prepared_dataset
+        _has_data_config = bool(training_args.data_config)
+
+        # New-style: data_config is set, so we can auto-blend if needed
+        if _has_data_config:
+            if needs_blend(_prepared):
+                # Path is missing/empty — auto-run blend
+                logger.info(f"Prepared dataset not found at {_prepared} — running blend automatically.")
+                run_auto_blend(training_args, model_args)
+            else:
+                # Path exists — validate metadata matches current config
+                blend_config = build_blend_config(training_args, model_args)
+                mismatches = validate_blend_metadata(_prepared, blend_config)
+                if mismatches:
+                    # Prompt user to overwrite (rank 0 only, exits on 'n')
+                    prompt_blend_overwrite(_prepared, mismatches)
+                    # User said yes — re-blend
+                    run_auto_blend(training_args, model_args)
+
+        # Load the prepared dataset (now guaranteed to exist if data_config was set)
+        logger.info(f"Loading prepared dataset from {_prepared}")
+        dataset = load_prepared_dataset(_prepared)
         logger.info(
             f"Loaded prepared dataset: {len(dataset['train'])} train"
             + (f", {len(dataset['test'])} test" if 'test' in dataset else "")
+        )
+        # If this is a new-style pre-tokenized blend, tell the trainer to skip truncation
+        if is_pretokenized_blend(_prepared):
+            training_args._pretokenized = True
+            logger.info("Detected pre-tokenized blend — skipping tokenization and truncation in trainer.")
+    elif training_args.data_config and not training_args.prepared_dataset:
+        # data_config is set but no prepared_dataset path — error with helpful message
+        raise ValueError(
+            "Training config has 'data_config' but no 'prepared_dataset' path. "
+            "Set 'prepared_dataset' to a directory where the blended data should be stored. "
+            "It will be created automatically if it doesn't exist."
         )
     elif dataset_args.datasets and script_args.dataset_name:
         logger.warning(

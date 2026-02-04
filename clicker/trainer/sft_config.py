@@ -356,13 +356,35 @@ class SFTConfig(TrainingArguments):
         },
     )
 
-    # Prepared dataset support
+    # Data config and prepared dataset support
+    data_config: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to a data config YAML file containing the dataset list and shuffle/subset settings. "
+            "Used by `clicker blend` to load datasets. The data config is model-agnostic and reusable across "
+            "different models. When specified alongside `prepared_dataset`, `clicker blend` uses this config "
+            "to build the dataset and saves to `prepared_dataset`."
+        },
+    )
+    eval_split: float = field(
+        default=0.0,
+        metadata={
+            "help": "Fraction of the dataset to use for evaluation (0-1). Applied AFTER tokenization and "
+            "truncation/splitting, so eval samples are a random cross-section of chunks rather than whole "
+            "documents. Set to 0.0 to disable. Used by `clicker blend`."
+        },
+    )
+    split_seed: int = field(
+        default=42,
+        metadata={"help": "Random seed for the train/eval split. Used by `clicker blend`."},
+    )
     prepared_dataset: Optional[str] = field(
         default=None,
         metadata={
             "help": "Path to a prepared dataset directory (created by `clicker blend`). "
             "When specified, the dataset is loaded from this path instead of being loaded/processed at runtime. "
-            "The prepared dataset will be tokenized for the model and cached for faster subsequent runs."
+            "If the prepared dataset is pre-tokenized (from new-style blend), it is used directly. "
+            "If untokenized (from old-style blend), it will be tokenized for the model and cached."
         },
     )
     tokenized_cache_dir: Optional[str] = field(

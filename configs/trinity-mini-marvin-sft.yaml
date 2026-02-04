@@ -1,0 +1,62 @@
+# Trinity Mini SCM - Marvin CPT/SFT
+# Text continuation training on marvin_no_anthologies dataset
+#
+# Usage (DeepSpeed ZeRO-3 with CPU offload):
+#   accelerate launch --config_file clicker/accelerate_configs/deepspeed_zero3_offload.yaml \
+#     clicker/scripts/sft.py --config configs/trinity-mini-marvin-sft.yaml
+
+# Model (local cache path to pick up config.json fix)
+model_name_or_path: /home/aibox/.cache/huggingface/hub/models--IntervitensInc--Trinity-Mini-SCM/snapshots/b97dc84365203fbc786cc990ab90a59a786ecde5
+trust_remote_code: true
+attn_implementation: sdpa
+
+# Dataset - all 154 texts, no eval
+dataset_name: /tmp/marvin-dataset
+dataset_train_split: train
+
+# Output
+output_dir: ./output/trinity-mini-marvin-sft
+run_name: trinity-mini-marvin-cpt
+
+# SFT / data processing
+max_length: 4096
+truncation_strategy: split
+dataset_text_field: text
+
+# Training
+num_train_epochs: 1
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 4
+gradient_checkpointing: true
+learning_rate: 2.0e-5
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+weight_decay: 0.01
+max_grad_norm: 1.0
+
+# LoRA (not QLoRA -- bnb can't quantize scattermoe ParallelExperts 3D tensors)
+use_peft: true
+lora_r: 32
+lora_alpha: 64
+lora_dropout: 0.0
+lora_target_modules: all-linear
+
+# No evaluation for this test run
+eval_strategy: "no"
+
+# Saving
+save_strategy: steps
+save_steps: 200
+save_total_limit: 3
+save_only_model: true
+
+# Logging
+logging_steps: 1
+report_to:
+  - wandb
+
+# Hardware
+bf16: true
+dataloader_num_workers: 2
+remove_unused_columns: false
