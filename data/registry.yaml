@@ -1,0 +1,14 @@
+# Dataset registry — map short names to full dataset specifications.
+#
+# Usage in data configs:
+#   datasets:
+#     - dataset: marvin        # resolved from this registry
+#       subset: 100            # per-entry overrides still work
+#
+# Each entry should have at minimum a 'path' field.
+# Any DatasetConfig field is valid (split, columns, system_message, etc.)
+
+marvin:
+  path: /tmp/marvin-dataset
+  split: train
+  description: "Marvin prose dataset (no anthologies), 154 texts"

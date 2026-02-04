@@ -168,8 +168,8 @@ def main(script_args, training_args, model_args, dataset_args):
                 mismatches = validate_blend_metadata(_prepared, blend_config)
                 if mismatches:
                     # Prompt user to overwrite (rank 0 only, exits on 'n')
-                    prompt_blend_overwrite(_prepared, mismatches)
-                    # User said yes — re-blend
+                    prompt_blend_overwrite(_prepared, mismatches, force=training_args.force_blend)
+                    # User said yes (or force_blend=True) — re-blend
                     run_auto_blend(training_args, model_args)
 
         # Load the prepared dataset (now guaranteed to exist if data_config was set)

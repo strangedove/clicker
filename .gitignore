@@ -148,3 +148,4 @@ wandb/
 .claude
 .ruff_cache
 note-to-claude.txt
+feature-notes.txt

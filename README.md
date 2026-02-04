@@ -17,6 +17,8 @@ A streamlined CLI tool for LLM post-training. Supports SFT, DPO, ORPO, KTO, GRPO
   - [RLOO (REINFORCE Leave-One-Out)](#rloo-reinforce-leave-one-out)
   - [Reward Model Training](#reward-model-training)
 - [Dataset Configuration](#dataset-configuration)
+- [Dataset Registry](#dataset-registry)
+- [Config Inheritance](#config-inheritance)
 - [Dataset Blending](#dataset-blending)
 - [LoRA Configuration](#lora-configuration)
 - [Reward Functions](#reward-functions)
@@ -177,16 +179,21 @@ clicker merge --config <config.yaml> [options]
 
 ### `clicker blend`
 
-Blend and preprocess datasets for training. Creates a prepared dataset that can be reused across different training runs and models.
+Blend, tokenize, and prepare datasets for training. Takes a training config (with `data_config` and `model_name_or_path`) and produces a pre-tokenized dataset ready for training.
 
 ```bash
-clicker blend --config <data_config.yaml> [--output <output_dir>]
+clicker blend --config <training_config.yaml> [--output <output_dir>]
+clicker blend --config <training_config.yaml> --dry-run
+clicker blend --config <training_config.yaml> --debug
 ```
 
 | Option | Description |
 |--------|-------------|
-| `--config` | Path to data blend config file |
-| `--output`, `-o` | Output directory (overrides config's `output_dir`) |
+| `--config` | Path to training config YAML (must have `data_config` and `model_name_or_path`) |
+| `--output`, `-o` | Output directory (overrides `prepared_dataset`/`output_dir` from config) |
+| `--dry-run` | Preview what blend would produce without tokenizing or saving anything |
+| `--debug` | Show tokenization debug view for one sample per dataset |
+| `--debug-max-tokens` | Max tokens to display in debug view (default: 200) |
 
 See [Dataset Blending](#dataset-blending) for detailed documentation.
 
@@ -325,6 +332,7 @@ use_cce: false                # Use Cut Cross-Entropy loss (memory efficient)
 | `prepared_dataset` | str | `null` | Path to prepared dataset from `clicker blend` |
 | `tokenized_cache_dir` | str | `null` | Custom cache directory for tokenized datasets |
 | `force_retokenize` | bool | `false` | Ignore cache and re-tokenize prepared dataset |
+| `force_blend` | bool | `false` | Auto-overwrite mismatched prepared datasets without prompting |
 
 **Truncation strategies:**
 
@@ -977,6 +985,145 @@ env:
 
 ---
 
+## Dataset Registry
+
+The dataset registry lets you define short names for datasets you use frequently, avoiding copy-pasting long paths and keeping column mappings in one place.
+
+### Registry File
+
+Create `data/registry.yaml` in your project root:
+
+```yaml
+# data/registry.yaml
+marvin:
+  path: /data/marvin-dataset
+  split: train
+  description: "Marvin prose dataset, 154 texts"
+
+fujin:
+  path: cooawoo/fujin-conversations
+  split: train
+  columns:
+    - conversations
+  description: "Fujin conversation dataset, 12k samples"
+
+capybara:
+  path: trl-lib/Capybara
+  split: train
+  description: "Capybara instruction-following dataset"
+```
+
+Any `DatasetConfig` field is valid in a registry entry (`path`, `split`, `columns`, `system_message`, `truncation_strategy`, etc.). The `description` field is informational and ignored during loading.
+
+### Using Registry Names
+
+Reference datasets by name in your data configs:
+
+```yaml
+# data/my-blend.yaml
+datasets:
+  - dataset: marvin           # Resolved from registry
+  - dataset: fujin
+    subset: 5000              # Per-entry overrides still work
+  - dataset: capybara
+    subset: 0.1
+    system_message: "You are a helpful assistant."
+```
+
+Overrides specified alongside `dataset:` are merged on top of registry defaults.
+
+### Custom Registry Path
+
+By default, Clicker looks for `data/registry.yaml` relative to the current working directory. To use a different path:
+
+```yaml
+# In your data config
+registry: /path/to/my-registry.yaml
+
+datasets:
+  - dataset: my-dataset-name
+```
+
+---
+
+## Config Inheritance
+
+Configs can inherit from a base config using the `base_config` field. This eliminates repetition when multiple experiments share most of their settings.
+
+### Basic Usage
+
+Create a base config with shared defaults:
+
+```yaml
+# configs/base-lora-sft.yaml
+num_train_epochs: 1
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4
+gradient_checkpointing: true
+learning_rate: 2.0e-5
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+weight_decay: 0.01
+max_grad_norm: 1.0
+
+use_peft: true
+lora_r: 32
+lora_alpha: 64
+lora_dropout: 0.0
+lora_target_modules: all-linear
+
+max_length: 4096
+truncation_strategy: split
+dataset_text_field: text
+
+save_strategy: steps
+save_steps: 200
+save_total_limit: 3
+bf16: true
+```
+
+Then create experiment-specific configs that inherit from it:
+
+```yaml
+# configs/my-experiment.yaml
+base_config: configs/base-lora-sft.yaml
+
+model_name_or_path: my-model
+trust_remote_code: true
+data_config: data/my-data.yaml
+output_dir: ./output/my-experiment
+learning_rate: 5e-5    # override base's 2e-5
+lora_r: 64             # override base's 32
+```
+
+All values from the base config are inherited. The child config only needs to specify what's different.
+
+### Override Rules
+
+- **Scalars and lists**: Child value replaces base value entirely
+- **Dicts** (e.g. `env`): Child dict is shallow-merged on top of base dict, so you can override individual keys without losing others
+- The `base_config` key is removed from the final resolved config
+
+### Chaining
+
+Base configs can reference their own `base_config`, forming an inheritance chain:
+
+```yaml
+# configs/base.yaml          → shared defaults
+# configs/base-lora.yaml     → base_config: configs/base.yaml + LoRA settings
+# configs/my-experiment.yaml  → base_config: configs/base-lora.yaml + experiment specifics
+```
+
+A depth limit of 10 prevents accidental circular references.
+
+### Path Resolution
+
+`base_config` paths are resolved relative to the current working directory first (matching how `data_config`, `output_dir`, and other paths work). If not found there, they're resolved relative to the config file's directory.
+
+Config inheritance works with both `clicker sft/dpo/...` (training commands) and `clicker blend`.
+
+---
+
 ## Dataset Blending
 
 Clicker provides a powerful dataset blending workflow that separates data preparation from model training. This allows you to:
@@ -1113,6 +1260,52 @@ force_retokenize: false                        # Set true to ignore cache
 **Data processing options:** (inherited from dataset mixer)
 
 See [Global data processing options](#multiple-datasets-dataset-mixer) for `shuffle_datasets`, `shuffle_combined`, `eval_split`, etc.
+
+### Dry Run
+
+Preview what a blend would produce without running the full tokenization pipeline:
+
+```bash
+clicker blend --config configs/my-training.yaml --dry-run
+```
+
+Output includes:
+- Dataset sizes and source paths
+- Token length distribution (sampled from 100 examples)
+- Estimated chunk counts (for split strategy) or drop counts
+- Estimated eval/train split sizes
+- Estimated disk usage
+
+This is useful for verifying your config before committing to a long blend run.
+
+### Tokenization Debug Inspector
+
+Inspect exactly how samples get processed through the full pipeline:
+
+```bash
+clicker blend --config configs/my-training.yaml --debug
+clicker blend --config configs/my-training.yaml --debug --debug-max-tokens 300
+```
+
+For each dataset in the config, the debug inspector picks one sample and shows:
+
+1. **Raw input** — the data as-is from the dataset (columns, format, content)
+2. **After preprocessing** — system message injection, turn order fixes, format conversion
+3. **After chat template** — the full formatted string as the tokenizer sees it
+4. **Token-level view** — each token colored by type:
+   - `[TRAIN]` — tokens the model learns from (green)
+   - `[MASKED]` — tokens not trained on, e.g. user/system turns (dim)
+   - `[SPECIAL]` — special tokens like BOS, EOS, turn delimiters (magenta)
+5. **Loss mask summary** — "Training on X/Y tokens (Z%)"
+6. **Warnings** — no EOS at end, sample would be split/dropped/truncated, suspiciously low or high train percentage
+
+This is the most useful debugging tool for catching "why is my model learning garbage" issues. Almost always the cause is a template or masking problem that you can't see without inspecting tokens.
+
+The debug inspector can also be run standalone:
+
+```bash
+python -m clicker.scripts.debug_tokens --config configs/my-training.yaml
+```
 
 ---
 
@@ -1284,6 +1477,7 @@ See `configs/` directory for complete examples:
 - `grpo.yaml` - Group Relative Policy Optimization
 - `rloo.yaml` - REINFORCE Leave-One-Out
 - `reward.yaml` - Reward model training
+- `base-lora-sft.yaml` - Base config for LoRA SFT (use with `base_config` inheritance)
 
 ---
 

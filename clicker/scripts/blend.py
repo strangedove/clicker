@@ -29,6 +29,7 @@ import hashlib
 import json
 import logging
 import os
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
@@ -50,32 +51,79 @@ from clicker.data_utils import (
     tokenize_sft_example,
     truncate_conversation_by_turns,
 )
-from clicker.scripts.utils import DatasetMixtureConfig, get_dataset
+from clicker.scripts.utils import DatasetMixtureConfig, get_dataset, resolve_config_inheritance
 
 
 logger = logging.getLogger(__name__)
 
-# Fun messages for the blend process
-BLEND_MESSAGES = {
-    "start": "🍹 Starting the blender...",
-    "loading_data": "📦 Loading data config from {path}...",
-    "loading_model": "🤖 Loading tokenizer from {model}...",
-    "loading_datasets": "📦 Gathering ingredients from {n} dataset(s)...",
-    "preprocessing": "🔄 Preprocessing (format conversion, system messages, turn order)...",
-    "tokenizing": "🔤 Tokenizing with {model}...",
-    "truncating": "✂️  Applying truncation strategy: {strategy} (max_length={max_length})...",
-    "splitting": "📊 Splitting eval: {eval_split:.1%} ({eval} eval, {train} train)...",
-    "no_eval": "📊 No eval split requested.",
-    "saving": "💾 Saving to {path}...",
-    "done": "✅ Dataset ready! Saved to {path}",
-    "stats": "📊 Final: {train} train samples, {eval} eval samples, {total} total",
-}
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Pipeline statistics tracker
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class PipelineStats:
+    """Tracks sample counts through each stage of the blend pipeline."""
+
+    steps: list = field(default_factory=list)
+
+    def record(self, stage: str, count: int, detail: str = ""):
+        self.steps.append({"stage": stage, "count": count, "detail": detail})
+
+    def format_summary(self) -> str:
+        """Format a waterfall summary of the pipeline."""
+        if not self.steps:
+            return ""
+
+        lines = ["", "📊 Pipeline summary:"]
+        max_stage_len = max(len(s["stage"]) for s in self.steps)
+        prev_count = None
+
+        for step in self.steps:
+            stage = step["stage"].ljust(max_stage_len)
+            count = step["count"]
+            detail = step["detail"]
+
+            if prev_count is not None and count < prev_count:
+                delta = f"  (-{prev_count - count} {detail})" if detail else f"  (-{prev_count - count})"
+            elif prev_count is not None and count > prev_count:
+                delta = f"  (+{count - prev_count} {detail})" if detail else f"  (+{count - prev_count})"
+            else:
+                delta = f"  ({detail})" if detail else ""
+
+            lines.append(f"  {stage}  {count:>8,}{delta}")
+            prev_count = count
+
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Config loading
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _load_data_config(data_config_path: str) -> DatasetMixtureConfig:
     """Load a data config YAML and return a DatasetMixtureConfig."""
-    with open(data_config_path) as f:
-        raw = yaml.safe_load(f)
+    if not os.path.isfile(data_config_path):
+        raise FileNotFoundError(
+            f"Data config file not found: {data_config_path}\n"
+            f"Check that the 'data_config' path in your training config is correct."
+        )
+    try:
+        with open(data_config_path) as f:
+            raw = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ValueError(f"Invalid YAML in data config {data_config_path}: {e}") from e
+
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Data config {data_config_path} must be a YAML mapping, got {type(raw).__name__}."
+        )
+    if "datasets" not in raw:
+        raise ValueError(
+            f"Data config {data_config_path} must have a 'datasets' list. "
+            f"Example:\n  datasets:\n    - path: /path/to/dataset\n      split: train"
+        )
 
     # Force eval_split to 0 — we do eval splitting AFTER tokenization
     raw["eval_split"] = 0.0
@@ -85,12 +133,30 @@ def _load_data_config(data_config_path: str) -> DatasetMixtureConfig:
 
 def _load_training_config(config_path: str) -> dict:
     """Load a training config YAML and return the raw dict."""
-    with open(config_path) as f:
-        return yaml.safe_load(f)
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"Training config file not found: {config_path}")
+    try:
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ValueError(f"Invalid YAML in training config {config_path}: {e}") from e
 
+    if not isinstance(config, dict):
+        raise ValueError(f"Training config {config_path} must be a YAML mapping, got {type(config).__name__}.")
+
+    # Resolve config inheritance (base_config field)
+    config = resolve_config_inheritance(config, config_path)
+
+    return config
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Preprocessing
+# ──────────────────────────────────────────────────────────────────────────────
 
 def preprocess_dataset(
     dataset: Dataset,
+    stats: PipelineStats,
     trainer_type: str = "sft",
     default_system_message: Optional[str] = None,
     fix_turn_order: bool = False,
@@ -107,8 +173,10 @@ def preprocess_dataset(
         map_kwargs["num_proc"] = num_proc
 
     if trainer_type != "sft":
-        # For now, only SFT preprocessing is supported in blend
         logger.warning(f"trainer_type={trainer_type} is not fully supported in blend yet. Proceeding with SFT logic.")
+
+    if len(dataset) == 0:
+        raise ValueError("Dataset is empty after loading. Check your data config paths and split names.")
 
     # Auto-convert preference datasets to SFT format
     first_example = next(iter(dataset))
@@ -116,33 +184,52 @@ def preprocess_dataset(
         logger.info("Detected preference dataset format — converting to SFT format.")
         column_names = dataset.column_names
         remove_cols = [c for c in ["prompt", "chosen", "rejected"] if c in column_names]
-        dataset = dataset.map(convert_preference_to_sft, remove_columns=remove_cols, **map_kwargs)
+        try:
+            dataset = dataset.map(convert_preference_to_sft, remove_columns=remove_cols, **map_kwargs)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to convert preference dataset to SFT format: {e}\n"
+                f"Expected columns: 'prompt', 'chosen', 'rejected' (each with 'role'/'content' dicts)."
+            ) from e
+        stats.record("Preference → SFT", len(dataset))
 
     elif is_binary_preference_dataset(first_example):
         logger.info("Detected binary preference dataset — converting to SFT format.")
         column_names = dataset.column_names
         remove_cols = [c for c in ["prompt", "completion", "label"] if c in column_names]
+        before = len(dataset)
 
         def convert_and_filter(example):
             result = convert_binary_preference_to_sft(example)
             return result if result is not None else {}
 
-        dataset = dataset.map(convert_and_filter, remove_columns=remove_cols, **map_kwargs)
-        original_len = len(dataset)
-        dataset = dataset.filter(lambda x: "messages" in x and len(x["messages"]) > 0, **map_kwargs)
-        if len(dataset) < original_len:
-            logger.info(f"Filtered out {original_len - len(dataset)} bad examples from binary preference dataset.")
+        try:
+            dataset = dataset.map(convert_and_filter, remove_columns=remove_cols, **map_kwargs)
+            dataset = dataset.filter(lambda x: "messages" in x and len(x["messages"]) > 0, **map_kwargs)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to convert binary preference dataset to SFT format: {e}\n"
+                f"Expected columns: 'prompt', 'completion', 'label'."
+            ) from e
+        stats.record("Binary pref → SFT", len(dataset), f"filtered {before - len(dataset)} bad examples")
 
     # Convert legacy conversation format to ChatML
     first_example = next(iter(dataset))
     if is_conversational_from_value(first_example):
         column_names = dataset.column_names
-        dataset = dataset.map(
-            maybe_convert_to_chatml,
-            remove_columns="conversations" if "conversations" in column_names else None,
-            desc="Converting to ChatML",
-            **map_kwargs,
-        )
+        try:
+            dataset = dataset.map(
+                maybe_convert_to_chatml,
+                remove_columns="conversations" if "conversations" in column_names else None,
+                desc="Converting to ChatML",
+                **map_kwargs,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to convert legacy conversation format to ChatML: {e}\n"
+                f"Expected 'conversations' column with list of {{'from': ..., 'value': ...}} dicts."
+            ) from e
+        stats.record("Convert to ChatML", len(dataset))
 
     # Add system messages
     column_names = dataset.column_names
@@ -156,16 +243,17 @@ def preprocess_dataset(
             desc="Adding system messages",
             **map_kwargs,
         )
+        stats.record("Add system messages", len(dataset))
 
     # Fix turn order
     if fix_turn_order and is_conversational(next(iter(dataset))):
+        before = len(dataset)
         dataset = dataset.map(
             fix_example_turn_order,
             fn_kwargs={"filler_message": fix_turn_order_filler},
             desc="Fixing turn order",
             **map_kwargs,
         )
-        original_len = len(dataset)
         dataset = dataset.filter(
             lambda x: any(
                 isinstance(x.get(k), list) and len(x.get(k, [])) > 0
@@ -173,15 +261,22 @@ def preprocess_dataset(
             ),
             **map_kwargs,
         )
-        if len(dataset) < original_len:
-            logger.warning(f"fix_turn_order: Dropped {original_len - len(dataset)} invalid examples.")
+        dropped = before - len(dataset)
+        if dropped:
+            logger.warning(f"fix_turn_order: Dropped {dropped} invalid examples.")
+        stats.record("Fix turn order", len(dataset), f"dropped {dropped} invalid" if dropped else "")
 
     return dataset
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Tokenization
+# ──────────────────────────────────────────────────────────────────────────────
+
 def tokenize_dataset(
     dataset: Dataset,
     processing_class,
+    stats: PipelineStats,
     dataset_text_field: str = "text",
     truncation_strategy: str = "truncate",
     max_length: Optional[int] = None,
@@ -224,6 +319,7 @@ def tokenize_dataset(
                 return example
 
             remove_cols = "_truncation_strategy" if has_per_dataset_strategy else None
+            before = len(dataset)
             dataset = dataset.map(
                 truncate_turns_fn,
                 fn_kwargs={
@@ -235,16 +331,17 @@ def tokenize_dataset(
                 desc="Truncating by turns",
                 **map_kwargs,
             )
-            original_len = len(dataset)
             dataset = dataset.filter(lambda x: not x.get("_truncation_drop", False), **map_kwargs)
-            if len(dataset) < original_len:
+            dropped = before - len(dataset)
+            if dropped:
                 logger.info(
-                    f"truncate_turns: Dropped {original_len - len(dataset)} samples that couldn't fit "
+                    f"truncate_turns: Dropped {dropped} samples that couldn't fit "
                     f"even one turn pair in max_length={max_length}."
                 )
             column_names = dataset.column_names
             if "_truncation_drop" in column_names:
                 dataset = dataset.remove_columns(["_truncation_drop"])
+            stats.record("Truncate turns", len(dataset), f"dropped {dropped}" if dropped else "")
 
     # Add EOS for plain text datasets
     first_example = next(iter(dataset))
@@ -265,37 +362,91 @@ def tokenize_dataset(
             **map_kwargs,
         )
 
+    # Detect dataset format for helpful error messages
+    first_example = next(iter(dataset))
+    is_chat = is_conversational(first_example)
+    has_text_field = dataset_text_field in first_example
+    if not is_chat and not has_text_field:
+        available = list(first_example.keys())
+        raise ValueError(
+            f"Dataset has neither chat format ('messages' column) nor the text field '{dataset_text_field}'.\n"
+            f"Available columns: {available}\n"
+            f"Set 'dataset_text_field' in your config to match your data, or convert to ChatML format."
+        )
+
     # Tokenize
-    dataset = dataset.map(
-        tokenize_sft_example,
-        fn_kwargs={
-            "processing_class": processing_class,
-            "dataset_text_field": dataset_text_field,
-            "assistant_only_loss": assistant_only_loss,
-            "last_assistant_only_loss": last_assistant_only_loss,
-            "train_on_incomplete_assistant": train_on_incomplete_assistant,
-            "eos_token_id": processing_class.eos_token_id,
-        },
-        desc="Tokenizing",
-        **map_kwargs,
-    )
+    try:
+        dataset = dataset.map(
+            tokenize_sft_example,
+            fn_kwargs={
+                "processing_class": processing_class,
+                "dataset_text_field": dataset_text_field,
+                "assistant_only_loss": assistant_only_loss,
+                "last_assistant_only_loss": last_assistant_only_loss,
+                "train_on_incomplete_assistant": train_on_incomplete_assistant,
+                "eos_token_id": processing_class.eos_token_id,
+            },
+            desc="Tokenizing",
+            **map_kwargs,
+        )
+    except Exception as e:
+        if is_chat and "chat_template" in str(e).lower():
+            raise RuntimeError(
+                f"Tokenization failed — likely a chat template issue: {e}\n"
+                f"The model's tokenizer may not have a chat template, or it's incompatible with your data.\n"
+                f"Try setting 'chat_template_path' in your config to a compatible template."
+            ) from e
+        elif is_chat:
+            raise RuntimeError(
+                f"Tokenization failed on chat-format data: {e}\n"
+                f"Check that your 'messages' column has the expected format: "
+                f"[{{'role': 'user', 'content': '...'}}, {{'role': 'assistant', 'content': '...'}}]"
+            ) from e
+        else:
+            raise RuntimeError(
+                f"Tokenization failed on text-format data: {e}\n"
+                f"Check that the '{dataset_text_field}' column contains text strings."
+            ) from e
+
+    stats.record("Tokenize", len(dataset))
 
     # Apply truncation strategy
     if max_length is not None:
         effective_strategy = truncation_strategy
         if effective_strategy == "truncate_turns":
             effective_strategy = "truncate"  # already handled above
-        dataset = apply_truncation_to_dataset(
-            dataset, processing_class, max_length, strategy=effective_strategy, num_proc=num_proc
-        )
+
+        before = len(dataset)
+        try:
+            dataset = apply_truncation_to_dataset(
+                dataset, processing_class, max_length, strategy=effective_strategy, num_proc=num_proc
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Truncation failed (strategy='{effective_strategy}', max_length={max_length}): {e}"
+            ) from e
+
+        detail = ""
+        if effective_strategy == "split":
+            detail = f"split into {max_length}-token chunks"
+        elif effective_strategy == "drop" and len(dataset) < before:
+            detail = f"dropped {before - len(dataset)} over-length samples"
+        elif effective_strategy == "truncate":
+            detail = f"truncated to {max_length} tokens"
+
+        stats.record("Truncation ({})".format(effective_strategy), len(dataset), detail)
 
     return dataset
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Main pipeline
+# ──────────────────────────────────────────────────────────────────────────────
+
 def prepare_dataset(
     training_config: dict,
     output_dir: Optional[str] = None,
-) -> DatasetDict:
+) -> tuple[DatasetDict, PipelineStats]:
     """
     Full pipeline: load data → preprocess → tokenize → truncate → eval split.
 
@@ -304,8 +455,10 @@ def prepare_dataset(
         output_dir: Override for output directory.
 
     Returns:
-        DatasetDict with "train" and optionally "test" splits.
+        Tuple of (DatasetDict with "train" and optionally "test" splits, PipelineStats).
     """
+    stats = PipelineStats()
+
     # Extract settings from training config
     data_config_path = training_config.get("data_config")
     if not data_config_path:
@@ -325,7 +478,7 @@ def prepare_dataset(
     eval_split = training_config.get("eval_split", 0.0)
     split_seed = training_config.get("split_seed", 42)
 
-    # Preprocessing options (from data config or training config)
+    # Preprocessing options
     default_system_message = training_config.get("default_system_message")
     fix_turn_order = training_config.get("fix_turn_order", False)
     fix_turn_order_filler = training_config.get("fix_turn_order_filler", "Let's begin.")
@@ -335,55 +488,80 @@ def prepare_dataset(
     num_proc = training_config.get("dataset_num_proc")
     chat_template_path = training_config.get("chat_template_path")
 
-    print(BLEND_MESSAGES["start"])
+    print("\n🍹 Starting the blender...")
+    print(f"   Config: max_length={max_length}, strategy={truncation_strategy}, "
+          f"eval_split={eval_split}, text_field={dataset_text_field}")
 
     # Step 1: Load data config
-    print(BLEND_MESSAGES["loading_data"].format(path=data_config_path))
+    print(f"\n📦 Loading data config from {data_config_path}...")
     data_config = _load_data_config(data_config_path)
-    print(BLEND_MESSAGES["loading_datasets"].format(n=len(data_config.datasets)))
+    print(f"   Found {len(data_config.datasets)} dataset(s)")
 
     # Load datasets (NO eval split — we do that after tokenization)
-    dataset_dict = get_dataset(data_config)
+    try:
+        dataset_dict = get_dataset(data_config)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load datasets from {data_config_path}: {e}\n"
+            f"Check that dataset paths exist and are readable."
+        ) from e
+
     dataset = dataset_dict["train"]
-    logger.info(f"Loaded {len(dataset)} training examples.")
+    stats.record("Loaded", len(dataset))
+    print(f"   {len(dataset):,} samples loaded")
 
     # Step 2: Load tokenizer
-    print(BLEND_MESSAGES["loading_model"].format(model=model_name_or_path))
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name_or_path,
-        trust_remote_code=trust_remote_code,
-    )
+    model_short = os.path.basename(model_name_or_path.rstrip("/")) if "/" in model_name_or_path else model_name_or_path
+    print(f"\n🤖 Loading tokenizer: {model_short}...")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=trust_remote_code,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load tokenizer from '{model_name_or_path}': {e}\n"
+            f"Check that model_name_or_path is correct and the model is downloaded."
+        ) from e
 
     # Apply chat template if specified
     if chat_template_path:
-        if os.path.isfile(chat_template_path):
-            with open(chat_template_path) as f:
-                tokenizer.chat_template = f.read()
-            logger.info(f"Loaded chat template from {chat_template_path}")
-        else:
-            # Treat as a model/tokenizer path on Hub
-            from transformers import AutoTokenizer as _AT
-            template_tokenizer = _AT.from_pretrained(chat_template_path, trust_remote_code=trust_remote_code)
-            tokenizer.chat_template = template_tokenizer.chat_template
-            logger.info(f"Loaded chat template from tokenizer: {chat_template_path}")
+        try:
+            if os.path.isfile(chat_template_path):
+                with open(chat_template_path) as f:
+                    tokenizer.chat_template = f.read()
+                print(f"   Loaded chat template from file: {chat_template_path}")
+            else:
+                from transformers import AutoTokenizer as _AT
+                template_tokenizer = _AT.from_pretrained(chat_template_path, trust_remote_code=trust_remote_code)
+                tokenizer.chat_template = template_tokenizer.chat_template
+                print(f"   Loaded chat template from model: {chat_template_path}")
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load chat template from '{chat_template_path}': {e}\n"
+                f"Provide either a path to a jinja2 template file, or a HuggingFace model ID."
+            ) from e
 
     # Step 3: Preprocess
-    print(BLEND_MESSAGES["preprocessing"])
+    print("\n🔄 Preprocessing...")
     dataset = preprocess_dataset(
         dataset,
+        stats,
         trainer_type="sft",
         default_system_message=default_system_message,
         fix_turn_order=fix_turn_order,
         fix_turn_order_filler=fix_turn_order_filler,
         num_proc=num_proc,
     )
+    stats.record("After preprocessing", len(dataset))
 
     # Step 4: Tokenize + truncate
-    print(BLEND_MESSAGES["tokenizing"].format(model=model_name_or_path))
-    print(BLEND_MESSAGES["truncating"].format(strategy=truncation_strategy, max_length=max_length))
+    print(f"\n🔤 Tokenizing with {model_short}...")
+    print(f"✂️  Truncation strategy: {truncation_strategy} (max_length={max_length})")
     dataset = tokenize_dataset(
         dataset,
         tokenizer,
+        stats,
         dataset_text_field=dataset_text_field,
         truncation_strategy=truncation_strategy,
         max_length=max_length,
@@ -397,33 +575,38 @@ def prepare_dataset(
     if eval_split and eval_split > 0:
         split_result = dataset.train_test_split(test_size=eval_split, seed=split_seed)
         result = DatasetDict({"train": split_result["train"], "test": split_result["test"]})
-        print(BLEND_MESSAGES["splitting"].format(
-            eval_split=eval_split,
-            eval=len(split_result["test"]),
-            train=len(split_result["train"]),
-        ))
+        stats.record("Train split", len(split_result["train"]))
+        stats.record("Eval split", len(split_result["test"]), f"{eval_split:.1%} of total")
+        print(f"\n📊 Eval split: {eval_split:.1%} → {len(split_result['train']):,} train, "
+              f"{len(split_result['test']):,} eval")
     else:
         result = DatasetDict({"train": dataset})
-        print(BLEND_MESSAGES["no_eval"])
+        stats.record("Final (no eval)", len(dataset))
+        print("\n📊 No eval split requested.")
 
-    return result
+    # Print waterfall summary
+    print(stats.format_summary())
+
+    return result, stats
 
 
 def save_prepared_dataset(
     dataset_dict: DatasetDict,
     output_dir: str,
     training_config: dict,
+    stats: Optional[PipelineStats] = None,
 ) -> None:
     """Save the prepared dataset to disk with metadata."""
     os.makedirs(output_dir, exist_ok=True)
 
-    print(BLEND_MESSAGES["saving"].format(path=output_dir))
+    print(f"💾 Saving to {output_dir}...")
 
     # Save each split as parquet
     for split_name, dataset in dataset_dict.items():
         split_path = os.path.join(output_dir, f"{split_name}.parquet")
         dataset.to_parquet(split_path)
-        logger.info(f"Saved {split_name} split to {split_path}")
+        size_mb = os.path.getsize(split_path) / (1024 * 1024)
+        print(f"   {split_name}: {len(dataset):,} samples ({size_mb:.1f} MB)")
 
     # Save metadata
     metadata = {
@@ -448,6 +631,10 @@ def save_prepared_dataset(
         },
     }
 
+    # Include pipeline stats in metadata if available
+    if stats is not None:
+        metadata["pipeline_steps"] = stats.steps
+
     # Config hash for cache invalidation
     config_str = json.dumps(training_config, sort_keys=True, default=str)
     metadata["config_hash"] = hashlib.sha256(config_str.encode()).hexdigest()[:16]
@@ -456,18 +643,186 @@ def save_prepared_dataset(
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
-    # Print summary
+    # Final summary
     train_count = metadata["splits"].get("train", 0)
     eval_count = metadata["splits"].get("test", 0)
     total_count = train_count + eval_count
-    print(BLEND_MESSAGES["stats"].format(train=train_count, eval=eval_count, total=total_count))
-    print(BLEND_MESSAGES["done"].format(path=output_dir))
+    print(f"\n✅ Dataset ready! {total_count:,} total ({train_count:,} train, {eval_count:,} eval)")
+    print(f"   Saved to {output_dir}")
 
 
-def main(config_path: str, output_override: Optional[str] = None):
+def dry_run(training_config: dict) -> None:
+    """
+    Show what a blend WOULD produce without actually tokenizing or saving.
+
+    Loads datasets and tokenizes a small sample to estimate:
+    - Dataset sizes
+    - Estimated chunk counts (for split strategy)
+    - Eval split sizes
+    - Estimated output disk usage
+    """
+    import math
+
+    data_config_path = training_config.get("data_config")
+    if not data_config_path:
+        raise ValueError("Training config must have a 'data_config' field.")
+
+    model_name_or_path = training_config.get("model_name_or_path")
+    if not model_name_or_path:
+        raise ValueError("Training config must have 'model_name_or_path'.")
+
+    trust_remote_code = training_config.get("trust_remote_code", False)
+    max_length = training_config.get("max_length", 1024)
+    truncation_strategy = training_config.get("truncation_strategy", "truncate")
+    dataset_text_field = training_config.get("dataset_text_field", "text")
+    eval_split = training_config.get("eval_split", 0.0)
+    model_short = os.path.basename(model_name_or_path.rstrip("/")) if "/" in model_name_or_path else model_name_or_path
+
+    print("\n🔍 Dry run — showing what blend would produce\n")
+    print("  Settings:")
+    print(f"    Model:               {model_short}")
+    print(f"    Max length:          {max_length:,} tokens")
+    print(f"    Truncation strategy: {truncation_strategy}")
+    print(f"    Text field:          {dataset_text_field}")
+    print(f"    Eval split:          {eval_split:.1%}" if eval_split else "    Eval split:          none")
+
+    # Load data config and datasets
+    print(f"\n  Loading data config from {data_config_path}...")
+    data_config = _load_data_config(data_config_path)
+    print(f"    Found {len(data_config.datasets)} dataset(s):")
+    for i, ds_cfg in enumerate(data_config.datasets):
+        label = ds_cfg.path
+        if hasattr(ds_cfg, 'subset') and ds_cfg.subset:
+            label += f" (subset: {ds_cfg.subset})"
+        print(f"      [{i+1}] {label}")
+
+    try:
+        dataset_dict = get_dataset(data_config)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load datasets: {e}") from e
+
+    dataset = dataset_dict["train"]
+    total_samples = len(dataset)
+    print(f"\n    Total samples loaded: {total_samples:,}")
+
+    # Load tokenizer and sample to estimate token lengths
+    print(f"\n  Loading tokenizer: {model_short}...")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load tokenizer: {e}") from e
+
+    # Tokenize a sample (up to 100 examples) to estimate token length distribution
+    sample_size = min(100, total_samples)
+    sample_ds = dataset.select(range(sample_size))
+
+    token_lengths = []
+    first = next(iter(sample_ds))
+    is_chat = is_conversational(first)
+
+    for example in sample_ds:
+        if is_chat:
+            messages = example.get("messages", [])
+            try:
+                text = tokenizer.apply_chat_template(messages, tokenize=False)
+            except Exception:
+                text = str(messages)
+        else:
+            text = example.get(dataset_text_field, "")
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        token_lengths.append(len(tokens))
+
+    if not token_lengths:
+        print("\n  ⚠️  No samples to estimate from.")
+        return
+
+    avg_tokens = sum(token_lengths) / len(token_lengths)
+    min_tokens = min(token_lengths)
+    max_tokens = max(token_lengths)
+    median_tokens = sorted(token_lengths)[len(token_lengths) // 2]
+
+    print(f"\n  Token length distribution (sampled {sample_size} examples):")
+    print(f"    Min:    {min_tokens:>8,} tokens")
+    print(f"    Median: {median_tokens:>8,} tokens")
+    print(f"    Mean:   {avg_tokens:>8,.0f} tokens")
+    print(f"    Max:    {max_tokens:>8,} tokens")
+
+    # Estimate chunk counts based on truncation strategy
+    if truncation_strategy == "split":
+        # Each sample produces ceil(token_length / max_length) chunks
+        est_chunks_per_sample = [math.ceil(tl / max_length) for tl in token_lengths]
+        avg_chunks = sum(est_chunks_per_sample) / len(est_chunks_per_sample)
+        est_total_chunks = int(avg_chunks * total_samples)
+
+        over_length = sum(1 for tl in token_lengths if tl > max_length)
+        over_pct = over_length / len(token_lengths) * 100
+
+        print(f"\n  Estimated output (split strategy):")
+        print(f"    Samples over max_length:    {over_pct:.0f}% ({over_length}/{sample_size} sampled)")
+        print(f"    Avg chunks per sample:      {avg_chunks:.1f}")
+        print(f"    Estimated total chunks:     ~{est_total_chunks:,}")
+
+    elif truncation_strategy == "drop":
+        over_length = sum(1 for tl in token_lengths if tl > max_length)
+        drop_pct = over_length / len(token_lengths) * 100
+        est_remaining = int(total_samples * (1 - drop_pct / 100))
+
+        print(f"\n  Estimated output (drop strategy):")
+        print(f"    Samples over max_length:    {drop_pct:.0f}% ({over_length}/{sample_size} sampled)")
+        print(f"    Estimated samples dropped:  ~{total_samples - est_remaining:,}")
+        print(f"    Estimated samples kept:     ~{est_remaining:,}")
+        est_total_chunks = est_remaining
+
+    else:  # truncate
+        over_length = sum(1 for tl in token_lengths if tl > max_length)
+        over_pct = over_length / len(token_lengths) * 100
+
+        print(f"\n  Estimated output (truncate strategy):")
+        print(f"    Samples over max_length:    {over_pct:.0f}% ({over_length}/{sample_size} sampled) — will be truncated")
+        print(f"    Total samples:              {total_samples:,} (unchanged)")
+        est_total_chunks = total_samples
+
+    # Eval split estimate
+    if eval_split and eval_split > 0:
+        est_eval = int(est_total_chunks * eval_split)
+        est_train = est_total_chunks - est_eval
+        print(f"\n  Eval split ({eval_split:.1%}):")
+        print(f"    Estimated train: ~{est_train:,}")
+        print(f"    Estimated eval:  ~{est_eval:,}")
+    else:
+        est_train = est_total_chunks
+        print(f"\n  No eval split — all {est_total_chunks:,} chunks go to train")
+
+    # Disk usage estimate (rough: ~4 bytes per token for input_ids + labels + attention_mask)
+    bytes_per_token = 4 * 3  # input_ids, labels, attention_mask (int32 each)
+    avg_chunk_tokens = min(avg_tokens, max_length) if truncation_strategy != "split" else max_length
+    est_bytes = est_total_chunks * avg_chunk_tokens * bytes_per_token
+    est_mb = est_bytes / (1024 * 1024)
+
+    print(f"\n  Estimated disk usage:           ~{est_mb:.0f} MB")
+
+    print("\n  ✅ Dry run complete — no data was written.\n")
+
+
+def main(
+    config_path: str,
+    output_override: Optional[str] = None,
+    is_dry_run: bool = False,
+    is_debug: bool = False,
+    debug_max_tokens: int = 200,
+):
     """Main entry point for the blend command."""
     # Load training config
     training_config = _load_training_config(config_path)
+
+    if is_debug:
+        from clicker.scripts.debug_tokens import run_debug
+        run_debug(training_config, max_display_tokens=debug_max_tokens)
+        return
+
+    if is_dry_run:
+        dry_run(training_config)
+        return
 
     # Determine output directory
     output_dir = output_override or training_config.get("prepared_dataset") or training_config.get("output_dir")
@@ -478,10 +833,10 @@ def main(config_path: str, output_override: Optional[str] = None):
         )
 
     # Run the pipeline
-    dataset_dict = prepare_dataset(training_config)
+    dataset_dict, stats = prepare_dataset(training_config)
 
     # Save
-    save_prepared_dataset(dataset_dict, output_dir, training_config)
+    save_prepared_dataset(dataset_dict, output_dir, training_config, stats)
 
 
 def make_parser(subparsers: Optional[argparse._SubParsersAction] = None):
@@ -508,6 +863,24 @@ def make_parser(subparsers: Optional[argparse._SubParsersAction] = None):
         default=None,
         help="Output directory (overrides prepared_dataset/output_dir from config)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Preview what blend would produce without tokenizing or saving anything",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Show tokenization debug view for one sample per dataset (raw → template → tokens → loss mask)",
+    )
+    parser.add_argument(
+        "--debug-max-tokens",
+        type=int,
+        default=200,
+        help="Max tokens to display in debug token-level view (default: 200)",
+    )
 
     return parser
 
@@ -516,4 +889,10 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     parser = make_parser()
     args = parser.parse_args()
-    main(args.config, args.output)
+    main(
+        args.config,
+        args.output,
+        is_dry_run=args.dry_run,
+        is_debug=args.debug,
+        debug_max_tokens=args.debug_max_tokens,
+    )

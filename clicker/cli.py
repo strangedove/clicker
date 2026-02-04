@@ -97,7 +97,13 @@ def main():
         # Blend/preprocess datasets - doesn't need accelerate launch
         blend_parser = make_blend_parser()
         blend_args = blend_parser.parse_args(sys.argv[2:])
-        blend_main(blend_args.config, blend_args.output)
+        blend_main(
+            blend_args.config,
+            blend_args.output,
+            is_dry_run=blend_args.dry_run,
+            is_debug=blend_args.debug,
+            debug_max_tokens=blend_args.debug_max_tokens,
+        )
 
     elif args.command == "dpo":
         # Get the default args for the launch command

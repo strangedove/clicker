@@ -400,6 +400,14 @@ class SFTConfig(TrainingArguments):
             "help": "If True, ignore cached tokenized datasets and re-tokenize from the prepared dataset."
         },
     )
+    force_blend: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, auto-overwrite mismatched prepared datasets without prompting. "
+            "Useful for non-interactive environments (CI, automated runs, SLURM jobs) where "
+            "stdin is not a TTY and the interactive prompt would otherwise abort."
+        },
+    )
 
     def __post_init__(self):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16

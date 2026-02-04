@@ -54,6 +54,112 @@ _ensure_transformers_parallelism_config()  # before creating HfArgumentParser
 logger = logging.getLogger(__name__)
 
 
+_MAX_CONFIG_INHERITANCE_DEPTH = 10
+
+
+def resolve_config_inheritance(config: dict, config_path: Optional[str] = None) -> dict:
+    """
+    Resolve ``base_config`` inheritance for a YAML config.
+
+    If ``config`` contains a ``base_config`` key, the referenced YAML is loaded
+    first, then the child config is overlaid on top.  Supports chaining (a base
+    can reference its own ``base_config``) with a depth limit to prevent cycles.
+
+    For list-valued keys (e.g. ``lora_target_modules``, ``report_to``), the
+    child value **replaces** the base value entirely (no merging). For
+    dict-valued keys (e.g. ``env``), the child dict is shallow-merged on top of
+    the base dict so you can override individual keys.
+
+    Args:
+        config: Raw dict loaded from a YAML file.
+        config_path: Path to the YAML file that ``config`` came from, used to
+            resolve relative ``base_config`` paths.  May be ``None`` if paths
+            are absolute.
+
+    Returns:
+        A new dict with the inheritance chain fully resolved.  The
+        ``base_config`` key is removed from the result.
+    """
+    if "base_config" not in config:
+        return config
+
+    seen: list[str] = []
+    if config_path:
+        seen.append(os.path.abspath(config_path))
+
+    merged = _resolve_chain(config, config_path, seen, depth=0)
+    return merged
+
+
+def _resolve_chain(config: dict, config_path: Optional[str], seen: list[str], depth: int) -> dict:
+    """Recursive helper for :func:`resolve_config_inheritance`."""
+    if depth > _MAX_CONFIG_INHERITANCE_DEPTH:
+        raise ValueError(
+            f"Config inheritance depth exceeded {_MAX_CONFIG_INHERITANCE_DEPTH}. "
+            f"Check for circular base_config references.\n  Chain: {' -> '.join(seen)}"
+        )
+
+    base_config_ref = config.get("base_config")
+    if not base_config_ref:
+        # No base — strip the key and return
+        result = dict(config)
+        result.pop("base_config", None)
+        return result
+
+    # Resolve relative paths: try CWD first (matching how other config paths
+    # like data_config/output_dir work), then fall back to the config file's
+    # directory for sibling-relative references.
+    if not os.path.isabs(base_config_ref):
+        cwd_resolved = os.path.abspath(base_config_ref)
+        if os.path.isfile(cwd_resolved):
+            base_config_ref = cwd_resolved
+        elif config_path:
+            base_config_ref = os.path.join(os.path.dirname(os.path.abspath(config_path)), base_config_ref)
+            base_config_ref = os.path.abspath(base_config_ref)
+        else:
+            base_config_ref = cwd_resolved
+    base_config_ref = os.path.abspath(base_config_ref)
+
+    # Cycle detection
+    if base_config_ref in seen:
+        raise ValueError(
+            f"Circular config inheritance detected: {base_config_ref}\n"
+            f"  Chain: {' -> '.join(seen)} -> {base_config_ref}"
+        )
+    seen.append(base_config_ref)
+
+    # Load the base config
+    if not os.path.isfile(base_config_ref):
+        raise FileNotFoundError(
+            f"Base config file not found: {base_config_ref}\n"
+            f"Referenced by base_config in: {config_path or '(unknown)'}"
+        )
+    with open(base_config_ref) as f:
+        base = yaml.safe_load(f)
+    if not isinstance(base, dict):
+        raise ValueError(f"Base config {base_config_ref} must be a YAML mapping, got {type(base).__name__}.")
+
+    # Recurse in case the base also has a base_config
+    base = _resolve_chain(base, base_config_ref, seen, depth + 1)
+
+    # Overlay: child values override base values
+    child = dict(config)
+    child.pop("base_config", None)
+
+    merged = dict(base)
+    for key, value in child.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            # Shallow-merge dicts (e.g. env)
+            merged_dict = dict(merged[key])
+            merged_dict.update(value)
+            merged[key] = merged_dict
+        else:
+            # Everything else: child replaces base
+            merged[key] = value
+
+    return merged
+
+
 @dataclass
 class FileConfig:
     """
@@ -162,6 +268,72 @@ class DatasetConfig:
     eval_before_subset: Optional[bool] = None
 
 
+def _load_dataset_registry(registry_path: Optional[str] = None) -> dict:
+    """
+    Load the dataset registry YAML.
+
+    The registry maps short names to dataset specifications::
+
+        marvin:
+          path: /tmp/marvin-dataset
+          split: train
+          description: "Marvin prose, 154 texts"
+
+    Args:
+        registry_path: Explicit path to registry YAML. If None, tries
+            ``data/registry.yaml`` relative to CWD.
+
+    Returns:
+        Dict mapping dataset names to their config dicts. Empty dict if
+        no registry file is found.
+    """
+    if registry_path is None:
+        registry_path = os.path.join(os.getcwd(), "data", "registry.yaml")
+
+    if not os.path.isfile(registry_path):
+        return {}
+
+    with open(registry_path) as f:
+        raw = yaml.safe_load(f)
+
+    if not isinstance(raw, dict):
+        logger.warning(f"Dataset registry {registry_path} is not a mapping, ignoring.")
+        return {}
+
+    return raw
+
+
+def _resolve_dataset_entry(entry: dict, registry: dict) -> dict:
+    """
+    If a dataset entry uses ``dataset: <name>`` instead of ``path:``,
+    resolve it from the registry. Per-entry overrides (subset, shuffle, etc.)
+    are merged on top of the registry defaults.
+    """
+    name = entry.get("dataset")
+    if name is None:
+        return entry  # no resolution needed
+
+    if name not in registry:
+        available = ", ".join(sorted(registry.keys())) if registry else "(registry is empty)"
+        raise ValueError(
+            f"Dataset '{name}' not found in registry. Available: {available}\n"
+            f"Add it to data/registry.yaml or use 'path:' instead."
+        )
+
+    # Start with registry defaults, overlay with per-entry overrides
+    resolved = dict(registry[name])
+    for key, value in entry.items():
+        if key == "dataset":
+            continue  # consumed, not passed through
+        resolved[key] = value
+
+    # Strip fields that aren't valid DatasetConfig params
+    _valid_fields = {f.name for f in DatasetConfig.__dataclass_fields__.values()}
+    resolved = {k: v for k, v in resolved.items() if k in _valid_fields}
+
+    return resolved
+
+
 @dataclass
 class DatasetMixtureConfig:
     """
@@ -266,13 +438,27 @@ class DatasetMixtureConfig:
         default=42,
         metadata={"help": "Seed for train/eval splits. Separate from shuffle_seed for reproducibility."},
     )
+    registry: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to a dataset registry YAML. If not set, auto-discovers data/registry.yaml. "
+            "The registry maps short names to full dataset specs, so you can write "
+            "'dataset: marvin' instead of 'path: /tmp/marvin-dataset'."
+        },
+    )
 
     def __post_init__(self):
+        # Load dataset registry for name resolution
+        _registry = _load_dataset_registry(self.registry)
+
         # Convert any dataset dicts (from CLI/config parsing) into DatasetConfig objects
         # and expand per-file configs into separate DatasetConfigs
         expanded_datasets = []
         for dataset in self.datasets:
             if isinstance(dataset, dict):
+                # Resolve registry references (dataset: name -> path: ...)
+                if "dataset" in dataset and "path" not in dataset:
+                    dataset = _resolve_dataset_entry(dataset, _registry)
                 dataset = DatasetConfig(**dataset)
 
             # Check if data_files contains FileConfig objects (per-file settings)
@@ -646,6 +832,9 @@ class TrlParser(HfArgumentParser):
             config_path = args.pop(config_index)  # get the path to the config file
             with open(config_path) as yaml_file:
                 config = yaml.safe_load(yaml_file)
+
+            # Resolve config inheritance (base_config field)
+            config = resolve_config_inheritance(config, config_path)
 
             # Set the environment variables specified in the config file
             if "env" in config:
@@ -1115,8 +1304,8 @@ def run_auto_blend(training_args, model_args) -> None:
 
         blend_config = build_blend_config(training_args, model_args)
         print(f"\n🔄 Auto-running blend to prepare dataset at {output_dir}...")
-        dataset_dict = prepare_dataset(blend_config)
-        save_prepared_dataset(dataset_dict, output_dir, blend_config)
+        dataset_dict, stats = prepare_dataset(blend_config)
+        save_prepared_dataset(dataset_dict, output_dir, blend_config, stats)
         print()
 
     # Barrier: non-main processes wait for the output to exist
@@ -1134,12 +1323,13 @@ def run_auto_blend(training_args, model_args) -> None:
             )
 
 
-def prompt_blend_overwrite(prepared_path: str, mismatches: list[str]) -> bool:
+def prompt_blend_overwrite(prepared_path: str, mismatches: list[str], force: bool = False) -> bool:
     """
     Prompt user (on rank 0 only) whether to overwrite a mismatched prepared dataset.
 
     Returns True if user wants to re-blend, False to abort.
-    In non-interactive environments, defaults to aborting with an error message.
+    In non-interactive environments, defaults to aborting with an error message
+    unless ``force=True``.
     """
     import os
     import sys
@@ -1155,11 +1345,17 @@ def prompt_blend_overwrite(prepared_path: str, mismatches: list[str]) -> bool:
     print(f"\n  Prepared dataset: {prepared_path}")
     print()
 
+    # force_blend skips the prompt entirely
+    if force:
+        print("🔄 force_blend=True — auto-overwriting with re-blended data.")
+        return True
+
     # Check if we can prompt interactively
     if not sys.stdin.isatty():
         print(
             "❌ Non-interactive environment — cannot prompt for confirmation.\n"
-            "   Run `clicker blend` manually, or delete the prepared dataset directory to auto-blend."
+            "   Run `clicker blend` manually, delete the prepared dataset directory to auto-blend,\n"
+            "   or set force_blend: true in your training config."
         )
         sys.exit(1)
 
