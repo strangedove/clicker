@@ -1,19 +1,29 @@
 #!/bin/bash
 # Clicker Setup Script for RunPod
 # Usage: curl -sSL https://raw.githubusercontent.com/strangedove/clicker/main/scripts/setup-runpod.sh | bash
+#
+# Environment variables:
+#   CLICKER_BRANCH - Git branch to checkout (default: main)
+#   HF_KEY         - HuggingFace API token for model downloads
+#   WANDB_KEY      - Weights & Biases API key for logging
 
 set -e
 
+BRANCH="${CLICKER_BRANCH:-main}"
+
 echo "🚀 Setting up Clicker on RunPod..."
+echo "   Branch: $BRANCH"
 
 # Clone the repo
 if [ -d "/workspace/clicker" ]; then
     echo "📁 /workspace/clicker already exists, pulling latest..."
     cd /workspace/clicker
-    git pull
+    git fetch origin
+    git checkout "$BRANCH"
+    git pull origin "$BRANCH"
 else
     echo "📦 Cloning clicker repo..."
-    git clone https://github.com/strangedove/clicker.git /workspace/clicker
+    git clone -b "$BRANCH" https://github.com/strangedove/clicker.git /workspace/clicker
     cd /workspace/clicker
 fi
 
