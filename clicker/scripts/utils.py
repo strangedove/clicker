@@ -185,6 +185,10 @@ class FileConfig:
             Eval split fraction for this file, or `False` to exclude from eval.
         eval_before_subset (`bool`, *optional*):
             Whether to split eval before subsetting for this file.
+        max_length (`int`, *optional*):
+            Maximum sequence length for this file. Overrides the global `max_length` setting.
+            Useful when you want shorter truncation for specific data (e.g., 2048 for short-form
+            data while training at 4096 context).
     """
 
     file: str
@@ -195,6 +199,7 @@ class FileConfig:
     shuffle: Optional[bool] = None
     eval_split: Optional[Union[float, bool]] = None
     eval_before_subset: Optional[bool] = None
+    max_length: Optional[int] = None
 
 
 @dataclass
@@ -252,6 +257,10 @@ class DatasetConfig:
         eval_before_subset (`bool`, *optional*):
             Whether to split off eval data before applying subset. If `None`, uses the global setting.
             When `True`, eval is representative of full dataset. When `False` (default), eval size scales with subset.
+        max_length (`int`, *optional*):
+            Maximum sequence length for this dataset. Overrides the global `max_length` setting.
+            Useful when you want shorter truncation for specific data (e.g., 2048 for short-form
+            data while training at 4096 context).
     """
 
     path: str
@@ -266,6 +275,7 @@ class DatasetConfig:
     shuffle: Optional[bool] = None
     eval_split: Optional[Union[float, bool]] = None
     eval_before_subset: Optional[bool] = None
+    max_length: Optional[int] = None
 
 
 def _load_dataset_registry(registry_path: Optional[str] = None) -> dict:
@@ -488,6 +498,7 @@ class DatasetMixtureConfig:
                                 shuffle=file_config.shuffle if file_config.shuffle is not None else dataset.shuffle,
                                 eval_split=file_config.eval_split if file_config.eval_split is not None else dataset.eval_split,
                                 eval_before_subset=file_config.eval_before_subset if file_config.eval_before_subset is not None else dataset.eval_before_subset,
+                                max_length=file_config.max_length if file_config.max_length is not None else dataset.max_length,
                             )
                             expanded_datasets.append(expanded)
                         elif isinstance(file_item, str):
@@ -505,6 +516,7 @@ class DatasetMixtureConfig:
                                 shuffle=dataset.shuffle,
                                 eval_split=dataset.eval_split,
                                 eval_before_subset=dataset.eval_before_subset,
+                                max_length=dataset.max_length,
                             )
                             expanded_datasets.append(expanded)
                     continue  # Don't add the original dataset
@@ -974,6 +986,8 @@ def _process_single_dataset(
         dataset = dataset.add_column("_system_message", [dataset_config.system_message] * len(dataset))
     if dataset_config.truncation_strategy is not None:
         dataset = dataset.add_column("_truncation_strategy", [dataset_config.truncation_strategy] * len(dataset))
+    if dataset_config.max_length is not None:
+        dataset = dataset.add_column("_max_length", [dataset_config.max_length] * len(dataset))
 
     # Resolve per-dataset settings with global defaults
     should_shuffle = dataset_config.shuffle if dataset_config.shuffle is not None else mixture_config.shuffle_datasets

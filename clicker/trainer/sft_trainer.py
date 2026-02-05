@@ -1594,30 +1594,46 @@ class SFTTrainer(BaseTrainer):
                     # Already handled pre-tokenization, fall back to regular truncate
                     strategy = "truncate"
 
+                # Check for per-example max_length column
+                column_names = get_dataset_column_names(dataset)
+                has_per_example_max_length = "_max_length" in column_names
+
                 if strategy == "drop":
                     # Filter out samples exceeding max_length
                     if isinstance(dataset, Dataset):
                         original_len = len(dataset)
-                        dataset = dataset.filter(lambda x: len(x.get("input_ids", [])) <= args.max_length)
+                        if has_per_example_max_length:
+                            # Use per-example max_length if available
+                            dataset = dataset.filter(
+                                lambda x: len(x.get("input_ids", [])) <= x.get("_max_length", args.max_length)
+                            )
+                        else:
+                            dataset = dataset.filter(lambda x: len(x.get("input_ids", [])) <= args.max_length)
                         filtered_len = len(dataset)
                         if filtered_len < original_len:
                             logger.info(
                                 f"drop strategy: Filtered out {original_len - filtered_len} samples "
-                                f"exceeding max_length={args.max_length}."
+                                f"exceeding max_length."
                             )
+                        # Clean up _max_length column after drop
+                        if has_per_example_max_length and "_max_length" in get_dataset_column_names(dataset):
+                            dataset = dataset.remove_columns(["_max_length"])
                 elif strategy == "split":
                     # Split long sequences into chunks
                     if isinstance(dataset, Dataset):
                         map_kwargs["desc"] = f"Splitting {dataset_name} dataset into chunks"
 
-                    def apply_split(example, tokenizer, max_length):
+                    def apply_split(example, tokenizer, default_max_length):
+                        # Use per-example max_length if present, otherwise use default
+                        effective_max_length = example.pop("_max_length", None) or default_max_length
                         return apply_truncation_strategy_to_example(
-                            example, tokenizer, max_length, strategy="split"
+                            example, tokenizer, effective_max_length, strategy="split"
                         )
 
                     dataset = dataset.map(
                         apply_split,
-                        fn_kwargs={"tokenizer": processing_class, "max_length": args.max_length},
+                        fn_kwargs={"tokenizer": processing_class, "default_max_length": args.max_length},
+                        remove_columns=["_max_length"] if has_per_example_max_length else None,
                         **map_kwargs,
                     )
                     # Expand chunks into separate rows
@@ -1628,14 +1644,17 @@ class SFTTrainer(BaseTrainer):
                     if isinstance(dataset, Dataset):
                         map_kwargs["desc"] = f"Truncating {dataset_name} dataset"
 
-                    def apply_truncate(example, tokenizer, max_length):
+                    def apply_truncate(example, tokenizer, default_max_length):
+                        # Use per-example max_length if present, otherwise use default
+                        effective_max_length = example.pop("_max_length", None) or default_max_length
                         return apply_truncation_strategy_to_example(
-                            example, tokenizer, max_length, strategy="truncate"
+                            example, tokenizer, effective_max_length, strategy="truncate"
                         )
 
                     dataset = dataset.map(
                         apply_truncate,
-                        fn_kwargs={"tokenizer": processing_class, "max_length": args.max_length},
+                        fn_kwargs={"tokenizer": processing_class, "default_max_length": args.max_length},
+                        remove_columns=["_max_length"] if has_per_example_max_length else None,
                         **map_kwargs,
                     )
             # For Liger kernel, ensure only the essential columns

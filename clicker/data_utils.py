@@ -1746,7 +1746,7 @@ def apply_truncation_to_dataset(
     Args:
         dataset: HF Dataset with ``input_ids`` column.
         processing_class: Tokenizer (used by split/truncate internals).
-        max_length: Maximum sequence length.
+        max_length: Maximum sequence length (default; can be overridden per-example).
         strategy: One of ``"truncate"``, ``"drop"``, ``"split"``.
             (``"truncate_turns"`` should be applied *before* tokenization.)
         num_proc: Number of processes for ``dataset.map``.
@@ -1754,6 +1754,11 @@ def apply_truncation_to_dataset(
     Returns:
         Dataset with truncation applied.  For ``"split"``, chunks are expanded
         into separate rows.
+
+    Note:
+        If the dataset has a ``_max_length`` column, per-example max_length overrides
+        are used. This allows different datasets in a blend to have different truncation
+        lengths (e.g., 2048 for short-form data while training at 4096 context).
     """
     import logging as _logging
 
@@ -1766,44 +1771,64 @@ def apply_truncation_to_dataset(
     if strategy == "truncate_turns":
         strategy = "truncate"  # already handled pre-tokenization
 
+    # Check if per-example max_length is available
+    has_per_example_max_length = "_max_length" in dataset.column_names
+
     if strategy == "drop":
         original_len = len(dataset)
-        dataset = dataset.filter(
-            lambda x: len(x.get("input_ids", [])) <= max_length,
-            num_proc=num_proc,
-        )
+        if has_per_example_max_length:
+            # Use per-example max_length if available
+            dataset = dataset.filter(
+                lambda x: len(x.get("input_ids", [])) <= x.get("_max_length", max_length),
+                num_proc=num_proc,
+            )
+        else:
+            dataset = dataset.filter(
+                lambda x: len(x.get("input_ids", [])) <= max_length,
+                num_proc=num_proc,
+            )
         filtered_len = len(dataset)
         if filtered_len < original_len:
             _logger.info(
                 f"drop strategy: Filtered out {original_len - filtered_len} samples "
-                f"exceeding max_length={max_length}."
+                f"exceeding max_length."
             )
 
     elif strategy == "split":
-        def _apply_split(example, tokenizer, _max_length):
+        def _apply_split(example, tokenizer, default_max_length):
+            # Use per-example max_length if present, otherwise use default
+            effective_max_length = example.pop("_max_length", None) or default_max_length
             return apply_truncation_strategy_to_example(
-                example, tokenizer, _max_length, strategy="split"
+                example, tokenizer, effective_max_length, strategy="split"
             )
 
         dataset = dataset.map(
             _apply_split,
-            fn_kwargs={"tokenizer": processing_class, "_max_length": max_length},
+            fn_kwargs={"tokenizer": processing_class, "default_max_length": max_length},
+            remove_columns=["_max_length"] if has_per_example_max_length else None,
             desc="Splitting into chunks",
             **map_kwargs,
         )
         dataset = expand_split_chunks(dataset)
 
     else:  # "truncate"
-        def _apply_truncate(example, tokenizer, _max_length):
+        def _apply_truncate(example, tokenizer, default_max_length):
+            # Use per-example max_length if present, otherwise use default
+            effective_max_length = example.pop("_max_length", None) or default_max_length
             return apply_truncation_strategy_to_example(
-                example, tokenizer, _max_length, strategy="truncate"
+                example, tokenizer, effective_max_length, strategy="truncate"
             )
 
         dataset = dataset.map(
             _apply_truncate,
-            fn_kwargs={"tokenizer": processing_class, "_max_length": max_length},
+            fn_kwargs={"tokenizer": processing_class, "default_max_length": max_length},
+            remove_columns=["_max_length"] if has_per_example_max_length else None,
             desc="Truncating",
             **map_kwargs,
         )
+
+    # Clean up _max_length column if it's still present (e.g., for drop strategy)
+    if "_max_length" in dataset.column_names:
+        dataset = dataset.remove_columns(["_max_length"])
 
     return dataset

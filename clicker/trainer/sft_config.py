@@ -428,18 +428,9 @@ class SFTConfig(TrainingArguments):
             "to build the dataset and saves to `prepared_dataset`."
         },
     )
-    eval_split: float = field(
-        default=0.0,
-        metadata={
-            "help": "Fraction of the dataset to use for evaluation (0-1). Applied AFTER tokenization and "
-            "truncation/splitting, so eval samples are a random cross-section of chunks rather than whole "
-            "documents. Set to 0.0 to disable. Used by `clicker blend`."
-        },
-    )
-    split_seed: int = field(
-        default=42,
-        metadata={"help": "Random seed for the train/eval split. Used by `clicker blend`."},
-    )
+    # NOTE: eval_split and split_seed live in DatasetMixtureConfig (scripts/utils.py)
+    # to avoid argparse conflicts when both are parsed together in sft.py.
+    # blend.py reads them directly from the training YAML.
     prepared_dataset: Optional[str] = field(
         default=None,
         metadata={

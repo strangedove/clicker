@@ -301,16 +301,19 @@ def tokenize_dataset(
     # Handle truncate_turns before tokenization (needs message-level structure)
     column_names = dataset.column_names
     has_per_dataset_strategy = "_truncation_strategy" in column_names
+    has_per_dataset_max_length = "_max_length" in column_names
 
     if (truncation_strategy == "truncate_turns" or has_per_dataset_strategy) and max_length is not None:
         first_example = next(iter(dataset))
         if is_conversational(first_example):
-            def truncate_turns_fn(example, tokenizer, _max_length, default_strategy):
+            def truncate_turns_fn(example, tokenizer, default_max_length, default_strategy):
                 strategy = example.pop("_truncation_strategy", None) or default_strategy
                 if strategy != "truncate_turns":
                     return example
+                # Use per-example max_length if available, otherwise use default
+                effective_max_length = example.get("_max_length") or default_max_length
                 truncated = truncate_conversation_by_turns(
-                    example.get("messages", []), tokenizer, _max_length
+                    example.get("messages", []), tokenizer, effective_max_length
                 )
                 if truncated is None:
                     example["_truncation_drop"] = True
@@ -324,7 +327,7 @@ def tokenize_dataset(
                 truncate_turns_fn,
                 fn_kwargs={
                     "tokenizer": processing_class,
-                    "_max_length": max_length,
+                    "default_max_length": max_length,
                     "default_strategy": truncation_strategy,
                 },
                 remove_columns=remove_cols,
@@ -336,7 +339,7 @@ def tokenize_dataset(
             if dropped:
                 logger.info(
                     f"truncate_turns: Dropped {dropped} samples that couldn't fit "
-                    f"even one turn pair in max_length={max_length}."
+                    f"even one turn pair in max_length."
                 )
             column_names = dataset.column_names
             if "_truncation_drop" in column_names:
