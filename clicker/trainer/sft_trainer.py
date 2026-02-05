@@ -1184,6 +1184,14 @@ class SFTTrainer(BaseTrainer):
             self.model.add_model_tags(self._tag_names)
 
         self.aux_loss_enabled = getattr(model.config, "output_router_logits", False)
+        self.aux_loss_coef = getattr(model.config, "router_aux_loss_coef", 0.0)
+        if self.aux_loss_enabled and self.aux_loss_coef == 0.0:
+            logger.warning(
+                "You set `output_router_logits` to `True` in the model config, but `router_aux_loss_coef` is "
+                "set to `0.0`, meaning the MoE load-balancing loss will not be added to the training loss. "
+                "Either set `router_aux_loss_coef` to a value greater than `0.0`, or set "
+                "`output_router_logits` to `False` if you don't want to use the MoE auxiliary loss."
+            )
 
     def _prepare_dataset(
         self,
@@ -1673,6 +1681,12 @@ class SFTTrainer(BaseTrainer):
         (loss, outputs) = super().compute_loss(
             model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
         )
+
+        # Add MoE router load-balancing auxiliary loss to the training objective
+        if self.aux_loss_enabled and self.aux_loss_coef > 0:
+            aux_loss = getattr(outputs, "aux_loss", None)
+            if aux_loss is not None:
+                loss = loss + self.aux_loss_coef * aux_loss
 
         # Compute auxiliary losses (only when logits are available)
         if not self.args.use_liger_kernel:
