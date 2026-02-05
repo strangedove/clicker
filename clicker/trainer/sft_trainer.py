@@ -225,6 +225,7 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
     completion_only_loss: bool = True
     padding_free: bool = False
     pad_to_multiple_of: Optional[int] = None
+    pass_through_assistant_masks: bool = False
     return_tensors: str = "pt"
 
     def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -291,6 +292,8 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
                 assistant_masks, padding_value=0, padding_side="right", pad_to_multiple_of=self.pad_to_multiple_of
             )
             output["labels"][assistant_masks == 0] = -100
+            if self.pass_through_assistant_masks:
+                output["assistant_masks"] = assistant_masks
         return output
 
     @staticmethod
@@ -548,6 +551,212 @@ def dft_loss(outputs, labels, num_items_in_batch=None):
     if num_items_in_batch is None:
         num_items_in_batch = loss_mask.sum()
     loss = (per_token_loss * loss_mask).sum() / num_items_in_batch
+    return loss
+
+
+def aux_eos_calibration_loss(logits, labels, assistant_masks, eos_token_id):
+    """
+    EOS calibration auxiliary loss.
+
+    Adds extra cross-entropy on EOS token at positions where the model should stop generating
+    (end of assistant turns). This encourages the model to assign higher probability to EOS
+    at turn boundaries.
+
+    The target positions are the last token of each contiguous assistant segment in the mask.
+    At those positions, we compute cross-entropy loss specifically for the EOS token.
+
+    Args:
+        logits: Model logits, shape (batch, seq_len, vocab_size)
+        labels: Shifted labels, shape (batch, seq_len) — only used for alignment
+        assistant_masks: Binary mask, shape (batch, seq_len), 1 = assistant token
+        eos_token_id: The EOS token ID to target
+
+    Returns:
+        Scalar loss (mean cross-entropy on EOS at turn-end positions), or 0 if no turn boundaries found.
+    """
+    # Shift assistant_masks to align with shifted labels (logits[:-1] predicts labels[1:])
+    shift_masks = assistant_masks[..., 1:].contiguous()
+    shift_logits = logits[..., :-1, :].contiguous()
+
+    # Find turn-end positions: where assistant_mask transitions from 1 to 0 (or ends at sequence boundary)
+    # A turn ends at position i if mask[i] == 1 and (mask[i+1] == 0 or i is the last position)
+    shift_labels = labels[..., 1:].contiguous()
+    padded = torch.nn.functional.pad(shift_masks, (0, 1), value=0)  # pad right with 0
+    turn_ends = (shift_masks == 1) & (padded[..., 1:] == 0) & (shift_labels != -100)  # shape: (batch, seq_len-1)
+
+    if not turn_ends.any():
+        return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
+    # At turn-end positions, compute cross-entropy targeting EOS
+    # We want the model to predict EOS at these positions
+    eos_targets = torch.full_like(shift_labels, fill_value=-100)
+    eos_targets[turn_ends] = eos_token_id
+
+    loss = nn.functional.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        eos_targets.view(-1),
+        ignore_index=-100,
+    )
+    return loss
+
+
+def aux_repetition_penalty_loss(logits, labels, window_size=64):
+    """
+    Repetition penalty auxiliary loss.
+
+    Penalizes the model for assigning high probability to tokens that have already appeared
+    within a sliding window of recent positions. This discourages repetitive generation patterns
+    at the weight level rather than only at inference time.
+
+    For each position, we look back `window_size` tokens in the ground-truth labels.
+    For each previous token found, we gather the model's predicted probability for that token
+    at the current position. The sum of these probabilities (normalized by window size) is the
+    penalty — the more probability the model puts on recently-seen tokens, the higher the loss.
+
+    Args:
+        logits: Model logits, shape (batch, seq_len, vocab_size)
+        labels: Shifted labels, shape (batch, seq_len), -100 for masked positions
+        window_size: How many previous tokens to consider as "recent"
+
+    Returns:
+        Scalar loss (mean probability mass on repeated tokens across trainable positions).
+    """
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    loss_mask = shift_labels != -100
+
+    batch_size, seq_len, vocab_size = shift_logits.shape
+
+    if not loss_mask.any():
+        return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
+    # Compute softmax once — all gathers are differentiable through this
+    probs = torch.softmax(shift_logits, dim=-1)
+
+    clean_labels = shift_labels.clone()
+    clean_labels[~loss_mask] = 0
+
+    # For each offset in the window, shift labels and gather the probability
+    # the model assigns to that token at the current position.
+    # This is O(window_size) gathers, each O(batch * seq_len).
+    rep_prob = torch.zeros(batch_size, seq_len, device=logits.device)
+    win = min(window_size, seq_len - 1)
+
+    for offset in range(1, win + 1):
+        # Token that appeared `offset` positions ago
+        prev_tok = torch.zeros(batch_size, seq_len, dtype=torch.long, device=logits.device)
+        prev_valid = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=logits.device)
+        prev_tok[:, offset:] = clean_labels[:, :seq_len - offset]
+        prev_valid[:, offset:] = loss_mask[:, :seq_len - offset]
+
+        # What probability does the model assign to that previous token at this position?
+        gathered = torch.gather(probs, dim=-1, index=prev_tok.unsqueeze(-1)).squeeze(-1)
+        rep_prob += gathered * prev_valid.float()
+
+    # Normalize by window size so the magnitude is independent of window choice
+    rep_prob = rep_prob / max(win, 1)
+
+    loss = (rep_prob * loss_mask.float()).sum() / loss_mask.sum()
+    return loss
+
+
+def aux_vocabulary_diversity_loss(logits, labels):
+    """
+    Vocabulary diversity auxiliary loss.
+
+    Upweights loss on rare tokens and downweights common tokens (within the batch) to encourage
+    the model to maintain a diverse vocabulary distribution rather than collapsing to a narrow
+    set of high-frequency outputs.
+
+    Token frequencies are computed per-batch from the ground-truth labels. Rare tokens get
+    higher weight, common tokens get lower weight. The weighting uses inverse frequency
+    (smoothed to avoid extreme weights on hapax legomena).
+
+    Args:
+        logits: Model logits, shape (batch, seq_len, vocab_size)
+        labels: Shifted labels, shape (batch, seq_len), -100 for masked positions
+
+    Returns:
+        Scalar loss (frequency-weighted cross-entropy on trainable positions).
+    """
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    loss_mask = shift_labels != -100
+
+    if not loss_mask.any():
+        return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
+    # Compute token frequencies within the batch (only trainable positions)
+    valid_tokens = shift_labels[loss_mask]  # 1D tensor of all trainable token IDs
+    num_valid = valid_tokens.numel()
+
+    # Count occurrences of each token in the batch
+    vocab_size = shift_logits.size(-1)
+    counts = torch.zeros(vocab_size, device=logits.device)
+    counts.scatter_add_(0, valid_tokens, torch.ones_like(valid_tokens, dtype=counts.dtype))
+
+    # Inverse frequency weighting with smoothing: weight = log(N / (count + 1)) + 1
+    # This gives rare tokens higher weight without extreme outliers
+    weights = torch.log(num_valid / (counts + 1.0)) + 1.0
+
+    # Look up the weight for each position's target token
+    clean_labels = shift_labels.clone()
+    clean_labels[~loss_mask] = 0
+    per_token_weights = weights[clean_labels]  # (batch, seq_len)
+    per_token_weights[~loss_mask] = 0.0
+
+    # Normalize weights to mean=1 so this loss is on the same scale as regular CE
+    weight_sum = per_token_weights[loss_mask].sum()
+    weight_mean = weight_sum / loss_mask.sum()
+    per_token_weights = per_token_weights / (weight_mean + 1e-8)
+
+    # Compute per-token cross-entropy
+    per_token_ce = nn.functional.cross_entropy(
+        shift_logits.view(-1, vocab_size),
+        shift_labels.view(-1),
+        ignore_index=-100,
+        reduction="none",
+    ).view(shift_labels.shape)
+
+    # Apply diversity weights
+    loss = (per_token_ce * per_token_weights * loss_mask.float()).sum() / loss_mask.sum()
+    return loss
+
+
+def aux_confidence_regularization_loss(logits, labels):
+    """
+    Confidence regularization auxiliary loss.
+
+    Penalizes the model for being too confident (low entropy) on its predictions at trainable
+    positions. This acts as targeted entropy regularization — encouraging the model to maintain
+    some uncertainty rather than collapsing to point predictions.
+
+    Unlike generic label smoothing, this only applies at positions where we compute loss
+    (respecting the existing masking). The loss is the negative entropy of the predicted
+    distribution, so maximizing entropy = minimizing this loss.
+
+    Args:
+        logits: Model logits, shape (batch, seq_len, vocab_size)
+        labels: Shifted labels, shape (batch, seq_len), -100 for masked positions
+
+    Returns:
+        Scalar loss (negative mean entropy at trainable positions).
+    """
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    loss_mask = shift_labels != -100
+
+    if not loss_mask.any():
+        return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
+    # Compute entropy at each position: H = -sum(p * log(p))
+    log_probs = torch.log_softmax(shift_logits, dim=-1)
+    probs = log_probs.exp()
+    per_token_entropy = -(probs * log_probs).sum(dim=-1)  # (batch, seq_len)
+
+    # The loss is negative entropy (we want to maximize entropy = minimize negative entropy)
+    neg_entropy = -per_token_entropy
+    loss = (neg_entropy * loss_mask.float()).sum() / loss_mask.sum()
     return loss
 
 
@@ -830,11 +1039,14 @@ class SFTTrainer(BaseTrainer):
                     f"`processing_class` ({processing_class.__class__.__name__}). Ensure that the `pad_token` exists "
                     "in the vocabulary before using it as a padding token."
                 )
+            # Pass assistant_masks through to compute_loss when EOS calibration is enabled
+            needs_assistant_masks = args.aux_loss_eos_weight > 0
             data_collator = DataCollatorForLanguageModeling(
                 pad_token_id=pad_token_id,
                 completion_only_loss=self.completion_only_loss,
                 padding_free=self.padding_free,
                 pad_to_multiple_of=args.pad_to_multiple_of,
+                pass_through_assistant_masks=needs_assistant_masks,
             )
         elif data_collator is None and self._is_vision_dataset:
             data_collator = DataCollatorForVisionLanguageModeling(
@@ -914,6 +1126,20 @@ class SFTTrainer(BaseTrainer):
             compute_loss_func = dft_loss
         else:
             raise ValueError(f"Invalid `loss_type` {args.loss_type} passed. Supported values are 'nll' and 'dft'.")
+
+        # Validate auxiliary loss configuration
+        if args.aux_loss_eos_weight > 0 and not (args.assistant_only_loss or args.last_assistant_only_loss):
+            logger.warning(
+                "EOS calibration loss (`aux_loss_eos_weight > 0`) works best with `assistant_only_loss=True` "
+                "so that assistant turn boundaries are available. Without it, no turn-end positions can be "
+                "identified and the EOS loss will have no effect."
+            )
+        if args.aux_loss_rep_weight > 0:
+            logger.info(f"Repetition penalty loss enabled (weight={args.aux_loss_rep_weight}, window={args.aux_loss_rep_window})")
+        if args.aux_loss_diversity_weight > 0:
+            logger.info(f"Vocabulary diversity loss enabled (weight={args.aux_loss_diversity_weight})")
+        if args.aux_loss_confidence_weight > 0:
+            logger.info(f"Confidence regularization loss enabled (weight={args.aux_loss_confidence_weight})")
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
@@ -1432,11 +1658,57 @@ class SFTTrainer(BaseTrainer):
         # This can be removed when this issue is fixed.
         labels = inputs["labels"]
 
+        # Pop assistant_masks before forward pass — the model doesn't expect them
+        assistant_masks = inputs.pop("assistant_masks", None)
+
         # If not set, defaults from model config and may warn since cache isn't compatible with gradient checkpointing
         inputs["use_cache"] = False
         (loss, outputs) = super().compute_loss(
             model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
         )
+
+        # Compute auxiliary losses (only when logits are available)
+        if not self.args.use_liger_kernel:
+            logits = outputs.logits
+            has_any_aux = (
+                self.args.aux_loss_eos_weight > 0
+                or self.args.aux_loss_rep_weight > 0
+                or self.args.aux_loss_diversity_weight > 0
+                or self.args.aux_loss_confidence_weight > 0
+            )
+            if has_any_aux:
+                # EOS calibration
+                if self.args.aux_loss_eos_weight > 0 and assistant_masks is not None:
+                    eos_token_id = self.processing_class.eos_token_id
+                    eos_loss = aux_eos_calibration_loss(logits, labels, assistant_masks, eos_token_id)
+                    loss = loss + self.args.aux_loss_eos_weight * eos_loss
+                    self._metrics[mode]["aux_loss_eos"].append(
+                        self.accelerator.gather_for_metrics(eos_loss.detach()).mean().item()
+                    )
+
+                # Repetition penalty
+                if self.args.aux_loss_rep_weight > 0:
+                    rep_loss = aux_repetition_penalty_loss(logits, labels, self.args.aux_loss_rep_window)
+                    loss = loss + self.args.aux_loss_rep_weight * rep_loss
+                    self._metrics[mode]["aux_loss_rep"].append(
+                        self.accelerator.gather_for_metrics(rep_loss.detach()).mean().item()
+                    )
+
+                # Vocabulary diversity
+                if self.args.aux_loss_diversity_weight > 0:
+                    div_loss = aux_vocabulary_diversity_loss(logits, labels)
+                    loss = loss + self.args.aux_loss_diversity_weight * div_loss
+                    self._metrics[mode]["aux_loss_diversity"].append(
+                        self.accelerator.gather_for_metrics(div_loss.detach()).mean().item()
+                    )
+
+                # Confidence regularization
+                if self.args.aux_loss_confidence_weight > 0:
+                    conf_loss = aux_confidence_regularization_loss(logits, labels)
+                    loss = loss + self.args.aux_loss_confidence_weight * conf_loss
+                    self._metrics[mode]["aux_loss_confidence"].append(
+                        self.accelerator.gather_for_metrics(conf_loss.detach()).mean().item()
+                    )
 
         # Compute entropy
         if not self.args.use_liger_kernel:  # liger doesn't return logits

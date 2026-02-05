@@ -344,6 +344,58 @@ class SFTConfig(TrainingArguments):
             )
         },
     )
+    # Auxiliary loss weights (0.0 = disabled, added on top of the primary loss_type)
+    aux_loss_eos_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Weight for the EOS calibration auxiliary loss. When > 0, adds an extra cross-entropy term on "
+                "EOS token positions at the end of assistant turns, encouraging the model to assign higher "
+                "probability to EOS where it should stop generating. Requires `assistant_only_loss=True` or "
+                "`completion_only_loss=True` so that turn boundaries are known. Typical values: 0.05-0.2."
+            )
+        },
+    )
+    aux_loss_rep_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Weight for the repetition penalty auxiliary loss. When > 0, penalizes the model for assigning "
+                "high probability to tokens that already appeared recently in the same sequence. Uses a sliding "
+                "window controlled by `aux_loss_rep_window`. Typical values: 0.01-0.1."
+            )
+        },
+    )
+    aux_loss_rep_window: int = field(
+        default=64,
+        metadata={
+            "help": (
+                "Window size (in tokens) for the repetition penalty auxiliary loss. The penalty applies to tokens "
+                "that appeared within the last N positions. Only used when `aux_loss_rep_weight > 0`."
+            )
+        },
+    )
+    aux_loss_diversity_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Weight for the vocabulary diversity auxiliary loss. When > 0, upweights loss on rare tokens "
+                "and downweights common tokens to encourage the model to maintain a diverse vocabulary rather "
+                "than collapsing to a narrow set of high-frequency outputs. Token frequencies are computed "
+                "per-batch. Typical values: 0.01-0.1."
+            )
+        },
+    )
+    aux_loss_confidence_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Weight for the confidence regularization auxiliary loss. When > 0, penalizes the model for "
+                "being too confident (low entropy) on predictions. Acts as a targeted label smoothing that "
+                "prevents overconfident predictions while maintaining calibration. Typical values: 0.01-0.05."
+            )
+        },
+    )
     activation_offloading: bool = field(
         default=False,
         metadata={"help": "Whether to offload the activations to the CPU."},
