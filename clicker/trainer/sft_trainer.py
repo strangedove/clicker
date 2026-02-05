@@ -660,7 +660,7 @@ def aux_repetition_penalty_loss(logits, labels, window_size=64):
     return loss
 
 
-def aux_vocabulary_diversity_loss(logits, labels):
+def aux_vocabulary_diversity_loss(logits, labels, max_weight_ratio=5.0):
     """
     Vocabulary diversity auxiliary loss.
 
@@ -675,6 +675,9 @@ def aux_vocabulary_diversity_loss(logits, labels):
     Args:
         logits: Model logits, shape (batch, seq_len, vocab_size)
         labels: Shifted labels, shape (batch, seq_len), -100 for masked positions
+        max_weight_ratio: Maximum ratio for per-token weights after normalization. Weights are
+            clamped to [1/max_weight_ratio, max_weight_ratio] to prevent extremely rare tokens
+            from having outsized influence. Set to 0 to disable clamping.
 
     Returns:
         Scalar loss (frequency-weighted cross-entropy on trainable positions).
@@ -709,6 +712,10 @@ def aux_vocabulary_diversity_loss(logits, labels):
     weight_sum = per_token_weights[loss_mask].sum()
     weight_mean = weight_sum / loss_mask.sum()
     per_token_weights = per_token_weights / (weight_mean + 1e-8)
+
+    # Clamp weights to prevent extreme values from dominating
+    if max_weight_ratio > 0:
+        per_token_weights = per_token_weights.clamp(min=1.0 / max_weight_ratio, max=max_weight_ratio)
 
     # Compute per-token cross-entropy
     per_token_ce = nn.functional.cross_entropy(
@@ -1696,7 +1703,9 @@ class SFTTrainer(BaseTrainer):
 
                 # Vocabulary diversity
                 if self.args.aux_loss_diversity_weight > 0:
-                    div_loss = aux_vocabulary_diversity_loss(logits, labels)
+                    div_loss = aux_vocabulary_diversity_loss(
+                        logits, labels, self.args.aux_loss_diversity_max_ratio
+                    )
                     loss = loss + self.args.aux_loss_diversity_weight * div_loss
                     self._metrics[mode]["aux_loss_diversity"].append(
                         self.accelerator.gather_for_metrics(div_loss.detach()).mean().item()

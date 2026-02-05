@@ -386,6 +386,16 @@ class SFTConfig(TrainingArguments):
             )
         },
     )
+    aux_loss_diversity_max_ratio: float = field(
+        default=5.0,
+        metadata={
+            "help": (
+                "Maximum ratio for per-token weights in the vocabulary diversity loss. After normalization "
+                "(mean=1), weights are clamped to [1/max_ratio, max_ratio]. This prevents extremely rare "
+                "tokens from having outsized influence. Set to 0 to disable clamping. Default: 5.0."
+            )
+        },
+    )
     aux_loss_confidence_weight: float = field(
         default=0.0,
         metadata={
