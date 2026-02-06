@@ -67,14 +67,24 @@ def main():
     # Deduplication and precedence (CLI over config) are handled later by launch_command_parser.
     args, launch_args = parser.parse_args_and_config(return_remaining_strings=True)
 
-    # Replace `--accelerate_config foo` with `--config_file trl/accelerate_configs/foo.yaml` if it is present in the
-    # launch_args. It allows the user to use predefined accelerate configs from the `trl` package.
+    # Handle accelerate_config from config file or CLI.
+    # Can be specified in the training YAML as:
+    #   accelerate_config: multi_gpu
+    # Or via CLI as:
+    #   clicker train --config my.yaml --accelerate_config multi_gpu
+    # CLI takes precedence if both are specified.
+    #
+    # The value can be:
+    #   - A predefined config name (e.g., "multi_gpu", "zero2", "fsdp1")
+    #   - A path to a custom accelerate config YAML file
+    #
+    # Converts `--accelerate_config foo` to `--config_file <resolved_path>` for accelerate.
     if "--accelerate_config" in launch_args:
         # Get the index of the '--accelerate_config' argument and the corresponding config name
         config_index = launch_args.index("--accelerate_config")
         config_name = launch_args[config_index + 1]
 
-        # If the config_name correspond to a path in the filesystem, we don't want to override it
+        # If the config_name corresponds to a path in the filesystem, use it directly
         if os.path.isfile(config_name):
             accelerate_config_path = config_name
         elif resources.files("clicker.accelerate_configs").joinpath(f"{config_name}.yaml").exists():  # pyright: ignore[reportAttributeAccessIssue]
@@ -82,8 +92,9 @@ def main():
             accelerate_config_path = resources.files("clicker.accelerate_configs").joinpath(f"{config_name}.yaml")
         else:
             raise ValueError(
-                f"Accelerate config {config_name} is neither a file nor a valid config in the `trl` package. "
-                "Please provide a valid config name or a path to a config file."
+                f"Accelerate config '{config_name}' is neither a file nor a valid predefined config. "
+                f"Available predefined configs: single_gpu, multi_gpu, zero1, zero2, zero3, fsdp1, fsdp2, fsdp_offload. "
+                "Or provide a path to a custom accelerate config YAML file."
             )
 
         # Remove '--accelerate_config' and its corresponding config name
