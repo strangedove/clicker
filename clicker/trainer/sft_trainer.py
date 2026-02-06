@@ -889,6 +889,32 @@ class SFTTrainer(BaseTrainer):
             dict_args.pop("push_to_hub_token")
             args = SFTConfig(**dict_args)
 
+        # Handle custom optimizers that aren't built into Transformers
+        # These are specified via optim field and converted to optimizer_cls_and_kwargs
+        if optimizer_cls_and_kwargs is None and args.optim is not None:
+            custom_optimizers = {
+                "came_pytorch": ("came_pytorch", "CAME"),
+            }
+            optim_str = args.optim if isinstance(args.optim, str) else args.optim.value
+            if optim_str in custom_optimizers:
+                module_name, class_name = custom_optimizers[optim_str]
+                try:
+                    import importlib
+                    optim_module = importlib.import_module(module_name)
+                    optim_class = getattr(optim_module, class_name)
+                    optim_kwargs = dict(args.optim_args) if args.optim_args else {}
+                    optim_kwargs["lr"] = args.learning_rate
+                    optim_kwargs["weight_decay"] = args.weight_decay
+                    optimizer_cls_and_kwargs = (optim_class, optim_kwargs)
+                    # Reset optim to adamw_torch so Trainer doesn't try to parse it
+                    args.optim = "adamw_torch"
+                    logger.info(f"Using custom optimizer: {module_name}.{class_name} with kwargs: {optim_kwargs}")
+                except ImportError as e:
+                    raise ImportError(
+                        f"Custom optimizer '{optim_str}' requires package '{module_name}' to be installed. "
+                        f"Install it with: pip install {module_name}"
+                    ) from e
+
         # Model
         if isinstance(model, str):
             model = create_model_from_path(model, **args.model_init_kwargs or {})
@@ -1047,7 +1073,7 @@ class SFTTrainer(BaseTrainer):
                     "in the vocabulary before using it as a padding token."
                 )
             # Pass assistant_masks through to compute_loss when EOS calibration is enabled
-            needs_assistant_masks = args.aux_loss_eos_weight > 0
+            needs_assistant_masks = (args.aux_loss_eos_weight or 0) > 0
             data_collator = DataCollatorForLanguageModeling(
                 pad_token_id=pad_token_id,
                 completion_only_loss=self.completion_only_loss,
@@ -1135,18 +1161,77 @@ class SFTTrainer(BaseTrainer):
             raise ValueError(f"Invalid `loss_type` {args.loss_type} passed. Supported values are 'nll' and 'dft'.")
 
         # Validate auxiliary loss configuration
-        if args.aux_loss_eos_weight > 0 and not (args.assistant_only_loss or args.last_assistant_only_loss):
+        has_any_aux_loss = (
+            (args.aux_loss_eos_weight or 0) > 0
+            or (args.aux_loss_rep_weight or 0) > 0
+            or (args.aux_loss_diversity_weight or 0) > 0
+            or (args.aux_loss_confidence_weight or 0) > 0
+        )
+        if has_any_aux_loss and (args.use_liger_kernel or args.use_cce):
+            logger.warning(
+                "Auxiliary losses (aux_loss_*) are configured but will be IGNORED because "
+                f"{'use_cce=True' if args.use_cce else 'use_liger_kernel=True'} is enabled. "
+                "CCE and Liger compute loss without materializing logits, so auxiliary losses that "
+                "require logits cannot be computed. Disable CCE/Liger to use auxiliary losses."
+            )
+        if (args.aux_loss_eos_weight or 0) > 0 and not (args.assistant_only_loss or args.last_assistant_only_loss):
             logger.warning(
                 "EOS calibration loss (`aux_loss_eos_weight > 0`) works best with `assistant_only_loss=True` "
                 "so that assistant turn boundaries are available. Without it, no turn-end positions can be "
                 "identified and the EOS loss will have no effect."
             )
-        if args.aux_loss_rep_weight > 0:
+        if (args.aux_loss_rep_weight or 0) > 0:
             logger.info(f"Repetition penalty loss enabled (weight={args.aux_loss_rep_weight}, window={args.aux_loss_rep_window})")
-        if args.aux_loss_diversity_weight > 0:
+        if (args.aux_loss_diversity_weight or 0) > 0:
             logger.info(f"Vocabulary diversity loss enabled (weight={args.aux_loss_diversity_weight})")
-        if args.aux_loss_confidence_weight > 0:
+        if (args.aux_loss_confidence_weight or 0) > 0:
             logger.info(f"Confidence regularization loss enabled (weight={args.aux_loss_confidence_weight})")
+
+        # Convert saves_per_epoch and evals_per_epoch to save_steps and eval_steps
+        # This must happen before super().__init__() so the TrainingArguments are set correctly
+        if args.saves_per_epoch is not None or args.evals_per_epoch is not None:
+            # Calculate steps per epoch
+            # We need: dataset_size / (batch_size * gradient_accumulation * world_size)
+            if train_dataset is not None and hasattr(train_dataset, "__len__"):
+                dataset_size = len(train_dataset)
+                batch_size = args.per_device_train_batch_size
+                grad_accum = args.gradient_accumulation_steps
+                # Get world size from accelerate state or default to 1
+                try:
+                    from accelerate.state import PartialState
+                    world_size = PartialState().num_processes
+                except Exception:
+                    world_size = 1
+
+                steps_per_epoch = dataset_size // (batch_size * grad_accum * world_size)
+                steps_per_epoch = max(1, steps_per_epoch)  # At least 1 step per epoch
+
+                if args.saves_per_epoch is not None:
+                    if args.saves_per_epoch > 0:
+                        save_steps = max(1, steps_per_epoch // args.saves_per_epoch)
+                        args.save_steps = save_steps
+                        args.save_strategy = "steps"
+                        logger.info(
+                            f"saves_per_epoch={args.saves_per_epoch} → save_steps={save_steps} "
+                            f"(dataset_size={dataset_size}, steps_per_epoch={steps_per_epoch})"
+                        )
+
+                if args.evals_per_epoch is not None:
+                    if args.evals_per_epoch > 0:
+                        eval_steps = max(1, steps_per_epoch // args.evals_per_epoch)
+                        args.eval_steps = eval_steps
+                        # Only set eval_strategy if we have an eval dataset
+                        if eval_dataset is not None:
+                            args.eval_strategy = "steps"
+                        logger.info(
+                            f"evals_per_epoch={args.evals_per_epoch} → eval_steps={eval_steps} "
+                            f"(dataset_size={dataset_size}, steps_per_epoch={steps_per_epoch})"
+                        )
+            else:
+                logger.warning(
+                    "saves_per_epoch/evals_per_epoch specified but dataset size is unknown "
+                    "(IterableDataset or no dataset). Falling back to default save/eval strategy."
+                )
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
@@ -1708,17 +1793,19 @@ class SFTTrainer(BaseTrainer):
                 loss = loss + self.aux_loss_coef * aux_loss
 
         # Compute auxiliary losses (only when logits are available)
-        if not self.args.use_liger_kernel:
+        # CCE and Liger don't return logits - they compute loss without materializing the full logit tensor
+        logits_available = not self.args.use_liger_kernel and not self.args.use_cce
+        if logits_available:
             logits = outputs.logits
             has_any_aux = (
-                self.args.aux_loss_eos_weight > 0
-                or self.args.aux_loss_rep_weight > 0
-                or self.args.aux_loss_diversity_weight > 0
-                or self.args.aux_loss_confidence_weight > 0
+                (self.args.aux_loss_eos_weight or 0) > 0
+                or (self.args.aux_loss_rep_weight or 0) > 0
+                or (self.args.aux_loss_diversity_weight or 0) > 0
+                or (self.args.aux_loss_confidence_weight or 0) > 0
             )
             if has_any_aux:
                 # EOS calibration
-                if self.args.aux_loss_eos_weight > 0 and assistant_masks is not None:
+                if (self.args.aux_loss_eos_weight or 0) > 0 and assistant_masks is not None:
                     eos_token_id = self.processing_class.eos_token_id
                     eos_loss = aux_eos_calibration_loss(logits, labels, assistant_masks, eos_token_id)
                     loss = loss + self.args.aux_loss_eos_weight * eos_loss
@@ -1727,7 +1814,7 @@ class SFTTrainer(BaseTrainer):
                     )
 
                 # Repetition penalty
-                if self.args.aux_loss_rep_weight > 0:
+                if (self.args.aux_loss_rep_weight or 0) > 0:
                     rep_loss = aux_repetition_penalty_loss(logits, labels, self.args.aux_loss_rep_window)
                     loss = loss + self.args.aux_loss_rep_weight * rep_loss
                     self._metrics[mode]["aux_loss_rep"].append(
@@ -1735,7 +1822,7 @@ class SFTTrainer(BaseTrainer):
                     )
 
                 # Vocabulary diversity
-                if self.args.aux_loss_diversity_weight > 0:
+                if (self.args.aux_loss_diversity_weight or 0) > 0:
                     div_loss = aux_vocabulary_diversity_loss(
                         logits, labels, self.args.aux_loss_diversity_max_ratio
                     )
@@ -1745,7 +1832,7 @@ class SFTTrainer(BaseTrainer):
                     )
 
                 # Confidence regularization
-                if self.args.aux_loss_confidence_weight > 0:
+                if (self.args.aux_loss_confidence_weight or 0) > 0:
                     conf_loss = aux_confidence_regularization_loss(logits, labels)
                     loss = loss + self.args.aux_loss_confidence_weight * conf_loss
                     self._metrics[mode]["aux_loss_confidence"].append(
@@ -1753,7 +1840,7 @@ class SFTTrainer(BaseTrainer):
                     )
 
         # Compute entropy
-        if not self.args.use_liger_kernel:  # liger doesn't return logits
+        if logits_available:
             with torch.no_grad():
                 per_token_entropy = entropy_from_logits(outputs.logits)
                 # When using Prompt Tuning, skip the virtual tokens in logits before entropy computation, since they
@@ -1786,8 +1873,8 @@ class SFTTrainer(BaseTrainer):
             self._total_train_tokens += num_tokens_in_batch
         self._metrics[mode]["num_tokens"] = [self._total_train_tokens]
 
-        # Compute token accuracy if we have labels and if the model is not using Liger (no logits)
-        if not self.args.use_liger_kernel:
+        # Compute token accuracy if we have labels and if logits are available
+        if logits_available:
             with torch.no_grad():
                 if "shift_labels" in inputs:
                     # When using CP, labels are pre-shifted. We must use these (and cannot manually shift) because:

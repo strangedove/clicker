@@ -64,6 +64,7 @@ python trl/scripts/sft.py \
 
 import argparse
 import os
+import sys
 from typing import Optional
 
 from accelerate import logging
@@ -106,11 +107,29 @@ def main(script_args, training_args, model_args, dataset_args):
     ################
     # Model init kwargs
     ################
+    # Infer model dtype from training config if not explicitly set
+    # This ensures Flash Attention compatibility when bf16/fp16 training is enabled
+    model_dtype = model_args.dtype
+    if model_dtype is None:
+        import torch
+        if training_args.bf16:
+            # Use bfloat16 if bf16 training is enabled and hardware supports it
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                model_dtype = "bfloat16"
+            else:
+                # Fallback to float16 if bf16 not supported
+                model_dtype = "float16"
+            logger.info(f"Inferred model dtype from bf16 training config: {model_dtype}")
+        elif training_args.fp16:
+            model_dtype = "float16"
+            logger.info(f"Inferred model dtype from fp16 training config: {model_dtype}")
+        # Otherwise leave as None (model default)
+
     model_kwargs = dict(
         revision=model_args.model_revision,
         trust_remote_code=model_args.trust_remote_code,
         attn_implementation=model_args.attn_implementation,
-        dtype=model_args.dtype,
+        dtype=model_dtype,
         low_cpu_mem_usage=model_args.low_cpu_mem_usage,
     )
     quantization_config = get_quantization_config(model_args)
@@ -229,8 +248,22 @@ def main(script_args, training_args, model_args, dataset_args):
         trainer.accelerator.print(f"🤗 Model pushed to the Hub in https://huggingface.co/{trainer.hub_model_id}.")
 
 
-def make_parser(subparsers: Optional[argparse._SubParsersAction] = None):
-    dataclass_types = (ScriptArguments, SFTConfig, ModelConfig, DatasetMixtureConfig)
+def make_parser(subparsers: Optional[argparse._SubParsersAction] = None, include_dataset_args: bool = True):
+    """
+    Create the argument parser for SFT training.
+
+    Args:
+        subparsers: Optional subparsers action for CLI integration.
+        include_dataset_args: If True, include DatasetMixtureConfig for inline dataset definitions.
+                             If False, only parse ScriptArguments, SFTConfig, and ModelConfig.
+                             When using a pre-tokenized prepared_dataset, DatasetMixtureConfig
+                             is not needed since all preprocessing was done during blend.
+    """
+    if include_dataset_args:
+        dataclass_types = (ScriptArguments, SFTConfig, ModelConfig, DatasetMixtureConfig)
+    else:
+        dataclass_types = (ScriptArguments, SFTConfig, ModelConfig)
+
     if subparsers is not None:
         parser = subparsers.add_parser("sft", help="Run the SFT training script", dataclass_types=dataclass_types)
     else:
@@ -238,12 +271,54 @@ def make_parser(subparsers: Optional[argparse._SubParsersAction] = None):
     return parser
 
 
+def _check_needs_dataset_args(config_path: Optional[str]) -> bool:
+    """
+    Quick check to see if the config uses prepared_dataset with data_config.
+    If so, we don't need DatasetMixtureConfig (preprocessing already done).
+    """
+    if not config_path:
+        return True  # No config file, need dataset args for CLI
+
+    import yaml
+    try:
+        with open(config_path) as f:
+            config = yaml.safe_load(f) or {}
+        # If prepared_dataset and data_config are set, preprocessing is done by blend
+        # We don't need DatasetMixtureConfig fields
+        has_prepared = bool(config.get("prepared_dataset"))
+        has_data_config = bool(config.get("data_config"))
+        return not (has_prepared and has_data_config)
+    except Exception:
+        return True  # On error, default to including dataset args
+
+
 if __name__ == "__main__":
-    parser = make_parser()
+    # First, check if we're using a config file with prepared_dataset
+    # If so, we skip DatasetMixtureConfig to avoid field conflicts
+    config_path = None
+    for i, arg in enumerate(sys.argv[1:], 1):
+        if arg == "--config" and i < len(sys.argv):
+            config_path = sys.argv[i + 1]
+            break
+        elif arg.startswith("--config="):
+            config_path = arg.split("=", 1)[1]
+            break
+
+    needs_dataset_args = _check_needs_dataset_args(config_path)
+    parser = make_parser(include_dataset_args=needs_dataset_args)
+
     # When using the trl cli, this script may be run with additional arguments, corresponding accelerate arguments.
     # To ensure that their parsing does not interfere with the script arguments, parse the arguments with
     # `return_remaining_strings=True`, then ignore the remaining strings.
-    script_args, training_args, model_args, dataset_args, _ = parser.parse_args_and_config(
-        return_remaining_strings=True
-    )
+    if needs_dataset_args:
+        script_args, training_args, model_args, dataset_args, _ = parser.parse_args_and_config(
+            return_remaining_strings=True
+        )
+    else:
+        # No DatasetMixtureConfig needed - create empty one
+        script_args, training_args, model_args, _ = parser.parse_args_and_config(
+            return_remaining_strings=True
+        )
+        dataset_args = DatasetMixtureConfig()
+
     main(script_args, training_args, model_args, dataset_args)

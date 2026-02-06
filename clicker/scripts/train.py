@@ -133,7 +133,7 @@ def main():
     # Handle both relative and absolute imports
     try:
         if trainer_type == "sft":
-            from .sft import main as trainer_main, make_parser
+            from .sft import main as trainer_main, make_parser, _check_needs_dataset_args
         elif trainer_type == "dpo":
             from .dpo import main as trainer_main, make_parser
         elif trainer_type == "orpo":
@@ -151,7 +151,7 @@ def main():
     except ImportError:
         # Fallback to absolute imports when run as script
         if trainer_type == "sft":
-            from clicker.scripts.sft import main as trainer_main, make_parser
+            from clicker.scripts.sft import main as trainer_main, make_parser, _check_needs_dataset_args
         elif trainer_type == "dpo":
             from clicker.scripts.dpo import main as trainer_main, make_parser
         elif trainer_type == "orpo":
@@ -168,14 +168,34 @@ def main():
             raise ValueError(f"Unknown trainer type: {trainer_type}")
 
     # Parse with the trainer-specific parser
-    parser = make_parser()
+    # For SFT, check if we need DatasetMixtureConfig based on config
+    if trainer_type == "sft" and peek_args.config:
+        needs_dataset_args = _check_needs_dataset_args(peek_args.config)
+        parser = make_parser(include_dataset_args=needs_dataset_args)
+    else:
+        parser = make_parser()
 
     # Re-inject the args (parse_args_and_config will handle --config)
     parsed = parser.parse_args_and_config(return_remaining_strings=True)
 
-    # The parsed tuple has format: (script_args, training_args, model_args, dataset_args, remaining)
-    # Call the trainer's main with the appropriate args (excluding remaining strings)
-    trainer_main(*parsed[:-1])
+    # The parsed tuple has format:
+    # - With DatasetMixtureConfig: (script_args, training_args, model_args, dataset_args, remaining)
+    # - Without DatasetMixtureConfig: (script_args, training_args, model_args, remaining)
+    # For SFT without dataset args, we need to create an empty DatasetMixtureConfig
+    if trainer_type == "sft":
+        if peek_args.config and not _check_needs_dataset_args(peek_args.config):
+            # Without dataset args, parsed has 4 elements: (script_args, training_args, model_args, remaining)
+            # We need to inject an empty DatasetMixtureConfig
+            from clicker import DatasetMixtureConfig
+            script_args, training_args, model_args, _ = parsed
+            dataset_args = DatasetMixtureConfig()
+            trainer_main(script_args, training_args, model_args, dataset_args)
+        else:
+            # With dataset args, parsed has 5 elements
+            trainer_main(*parsed[:-1])
+    else:
+        # Other trainers: call with all args except remaining strings
+        trainer_main(*parsed[:-1])
 
 
 def make_parser(subparsers: Optional[argparse._SubParsersAction] = None):

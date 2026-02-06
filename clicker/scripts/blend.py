@@ -25,6 +25,7 @@ Usage:
 """
 
 import argparse
+from collections import Counter
 import hashlib
 import json
 import logging
@@ -302,14 +303,33 @@ def tokenize_dataset(
     column_names = dataset.column_names
     has_per_dataset_strategy = "_truncation_strategy" in column_names
     has_per_dataset_max_length = "_max_length" in column_names
+    has_dataset_name = "_dataset_name" in column_names
+
+    # Print per-dataset breakdown if we have the info
+    if has_per_dataset_strategy and has_dataset_name:
+        # Count samples per dataset with truncate_turns strategy
+        truncate_turns_datasets = []
+        for ex in dataset:
+            if ex.get("_truncation_strategy") == "truncate_turns":
+                truncate_turns_datasets.append(ex.get("_dataset_name", "unknown"))
+        if truncate_turns_datasets:
+            counts = Counter(truncate_turns_datasets)
+            print("   Datasets using truncate_turns strategy:")
+            for ds_name, count in counts.most_common():
+                short_name = ds_name.split("/")[-1] if "/" in ds_name else ds_name
+                print(f"     • {short_name}: {count:,} samples")
 
     if (truncation_strategy == "truncate_turns" or has_per_dataset_strategy) and max_length is not None:
         first_example = next(iter(dataset))
         if is_conversational(first_example):
             def truncate_turns_fn(example, tokenizer, default_max_length, default_strategy):
-                strategy = example.pop("_truncation_strategy", None) or default_strategy
+                # Get strategy without popping - we need to preserve it for non-truncate_turns samples
+                strategy = example.get("_truncation_strategy") or default_strategy
                 if strategy != "truncate_turns":
                     return example
+                # For truncate_turns samples, mark as handled by setting strategy to "truncate"
+                # (truncate_turns becomes truncate after pre-tokenization handling)
+                example["_truncation_strategy"] = "truncate"
                 # Use per-example max_length if available, otherwise use default
                 effective_max_length = example.get("_max_length") or default_max_length
                 truncated = truncate_conversation_by_turns(
@@ -321,7 +341,7 @@ def tokenize_dataset(
                     example["messages"] = truncated
                 return example
 
-            remove_cols = "_truncation_strategy" if has_per_dataset_strategy else None
+            # Don't remove _truncation_strategy - we need it for post-tokenization truncation
             before = len(dataset)
             dataset = dataset.map(
                 truncate_turns_fn,
@@ -330,7 +350,6 @@ def tokenize_dataset(
                     "default_max_length": max_length,
                     "default_strategy": truncation_strategy,
                 },
-                remove_columns=remove_cols,
                 desc="Truncating by turns",
                 **map_kwargs,
             )
@@ -352,10 +371,12 @@ def tokenize_dataset(
         eos_token = processing_class.eos_token
 
         def add_eos(example, _eos_token):
-            if "text" in example and not example["text"].endswith(_eos_token):
-                example["text"] = example["text"] + _eos_token
-            elif "completion" in example and not example["completion"].endswith(_eos_token):
-                example["completion"] = example["completion"] + _eos_token
+            text_val = example.get("text")
+            completion_val = example.get("completion")
+            if text_val is not None and isinstance(text_val, str) and not text_val.endswith(_eos_token):
+                example["text"] = text_val + _eos_token
+            elif completion_val is not None and isinstance(completion_val, str) and not completion_val.endswith(_eos_token):
+                example["completion"] = completion_val + _eos_token
             return example
 
         dataset = dataset.map(
@@ -419,6 +440,16 @@ def tokenize_dataset(
         if effective_strategy == "truncate_turns":
             effective_strategy = "truncate"  # already handled above
 
+        # Check if we have per-sample strategies
+        has_per_sample_strategy = "_truncation_strategy" in dataset.column_names
+        if has_per_sample_strategy:
+            # Show per-strategy breakdown before applying
+            strategy_counts = Counter(dataset["_truncation_strategy"])
+            print("   Per-dataset truncation strategies:")
+            for strat, count in strategy_counts.most_common():
+                strat_name = strat if strat else f"default ({effective_strategy})"
+                print(f"     • {strat_name}: {count:,} samples")
+
         before = len(dataset)
         try:
             dataset = apply_truncation_to_dataset(
@@ -430,14 +461,20 @@ def tokenize_dataset(
             ) from e
 
         detail = ""
-        if effective_strategy == "split":
+        if has_per_sample_strategy:
+            detail = f"mixed strategies, {before:,} → {len(dataset):,}"
+            print(f"   Truncation complete: {before:,} → {len(dataset):,} samples ({len(dataset) - before:+,} delta)")
+        elif effective_strategy == "split":
             detail = f"split into {max_length}-token chunks"
+            print(f"   Split strategy: {before:,} → {len(dataset):,} samples ({len(dataset) - before:+,} from chunking)")
         elif effective_strategy == "drop" and len(dataset) < before:
             detail = f"dropped {before - len(dataset)} over-length samples"
+            print(f"   Drop strategy: {before:,} → {len(dataset):,} samples (dropped {before - len(dataset):,})")
         elif effective_strategy == "truncate":
             detail = f"truncated to {max_length} tokens"
+            print(f"   Truncate strategy: all samples capped at {max_length} tokens")
 
-        stats.record("Truncation ({})".format(effective_strategy), len(dataset), detail)
+        stats.record("Truncation ({})".format(effective_strategy if not has_per_sample_strategy else "mixed"), len(dataset), detail)
 
     return dataset
 
@@ -513,6 +550,15 @@ def prepare_dataset(
     stats.record("Loaded", len(dataset))
     print(f"   {len(dataset):,} samples loaded")
 
+    # Print per-dataset breakdown if we have dataset names
+    if "_dataset_name" in dataset.column_names:
+        dataset_counts = Counter(dataset["_dataset_name"])
+        print("   Per-dataset breakdown:")
+        for ds_name, count in dataset_counts.most_common():
+            # Shorten the name for display
+            short_name = ds_name.split("/")[-1] if "/" in ds_name else ds_name
+            print(f"     • {short_name}: {count:,} samples")
+
     # Step 2: Load tokenizer
     model_short = os.path.basename(model_name_or_path.rstrip("/")) if "/" in model_name_or_path else model_name_or_path
     print(f"\n🤖 Loading tokenizer: {model_short}...")
@@ -576,12 +622,59 @@ def prepare_dataset(
 
     # Step 5: Eval split (AFTER tokenization + chunking)
     if eval_split and eval_split > 0:
-        split_result = dataset.train_test_split(test_size=eval_split, seed=split_seed)
-        result = DatasetDict({"train": split_result["train"], "test": split_result["test"]})
-        stats.record("Train split", len(split_result["train"]))
-        stats.record("Eval split", len(split_result["test"]), f"{eval_split:.1%} of total")
-        print(f"\n📊 Eval split: {eval_split:.1%} → {len(split_result['train']):,} train, "
-              f"{len(split_result['test']):,} eval")
+        # Check for _no_eval column - samples marked with this should ONLY go to train
+        if "_no_eval" in dataset.column_names:
+            # Separate samples that should never be in eval
+            no_eval_mask = dataset["_no_eval"]
+            no_eval_indices = [i for i, v in enumerate(no_eval_mask) if v]
+            eval_eligible_indices = [i for i, v in enumerate(no_eval_mask) if not v]
+
+            no_eval_samples = dataset.select(no_eval_indices) if no_eval_indices else None
+            eval_eligible = dataset.select(eval_eligible_indices) if eval_eligible_indices else dataset
+
+            if no_eval_samples:
+                print(f"\n📊 Eval split: {len(no_eval_samples):,} samples excluded from eval (eval_split: false)")
+
+            # Split only the eval-eligible samples
+            if len(eval_eligible) > 0:
+                split_result = eval_eligible.train_test_split(test_size=eval_split, seed=split_seed)
+                train_split = split_result["train"]
+                test_split = split_result["test"]
+            else:
+                train_split = eval_eligible
+                test_split = None
+
+            # Add back the no_eval samples to training set
+            if no_eval_samples and len(no_eval_samples) > 0:
+                from datasets import concatenate_datasets
+                train_split = concatenate_datasets([train_split, no_eval_samples])
+
+            if test_split and len(test_split) > 0:
+                result = DatasetDict({"train": train_split, "test": test_split})
+            else:
+                result = DatasetDict({"train": train_split})
+        else:
+            split_result = dataset.train_test_split(test_size=eval_split, seed=split_seed)
+            train_split = split_result["train"]
+            test_split = split_result["test"]
+            result = DatasetDict({"train": train_split, "test": test_split})
+
+        stats.record("Train split", len(result["train"]))
+        if "test" in result:
+            stats.record("Eval split", len(result["test"]), f"{eval_split:.1%} of eligible")
+            print(f"   {eval_split:.1%} of eligible → {len(result['train']):,} train, "
+                  f"{len(result['test']):,} eval")
+
+            # Show per-dataset breakdown of eval split
+            if "_dataset_name" in result["test"].column_names:
+                eval_counts = Counter(result["test"]["_dataset_name"])
+                print("   Eval samples by dataset:")
+                for ds_name, count in eval_counts.most_common():
+                    short_name = ds_name.split("/")[-1] if "/" in ds_name else ds_name
+                    print(f"     • {short_name}: {count:,}")
+        else:
+            stats.record("Eval split", 0, "no eligible samples")
+            print(f"   No samples eligible for eval split")
     else:
         result = DatasetDict({"train": dataset})
         stats.record("Final (no eval)", len(dataset))
@@ -732,6 +825,11 @@ def dry_run(training_config: dict) -> None:
                 text = str(messages)
         else:
             text = example.get(dataset_text_field, "")
+        # Ensure text is a string (may be None or other type in malformed data)
+        if text is None:
+            text = ""
+        elif not isinstance(text, str):
+            text = str(text)
         tokens = tokenizer.encode(text, add_special_tokens=False)
         token_lengths.append(len(tokens))
 

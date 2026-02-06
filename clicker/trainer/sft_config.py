@@ -428,9 +428,6 @@ class SFTConfig(TrainingArguments):
             "to build the dataset and saves to `prepared_dataset`."
         },
     )
-    # NOTE: eval_split and split_seed live in DatasetMixtureConfig (scripts/utils.py)
-    # to avoid argparse conflicts when both are parsed together in sft.py.
-    # blend.py reads them directly from the training YAML.
     prepared_dataset: Optional[str] = field(
         default=None,
         metadata={
@@ -462,6 +459,36 @@ class SFTConfig(TrainingArguments):
         },
     )
 
+    # Convenience fields for per-epoch save/eval scheduling
+    saves_per_epoch: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Number of times to save per epoch. If set, automatically calculates save_steps based on "
+            "total training steps. Mutually exclusive with save_steps when > 0. For example, saves_per_epoch=2 "
+            "will save at the middle and end of each epoch."
+        },
+    )
+    evals_per_epoch: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Number of times to evaluate per epoch. If set, automatically calculates eval_steps based on "
+            "total training steps. Mutually exclusive with eval_steps when > 0. For example, evals_per_epoch=4 "
+            "will evaluate 4 times per epoch."
+        },
+    )
+
+    # W&B project name (handled by CLI, converted to WANDB_PROJECT env var)
+    wandb_project: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Weights & Biases project name. This field is extracted by the CLI and set as the "
+            "WANDB_PROJECT environment variable before training starts. It is not passed as a CLI argument."
+        },
+    )
+
+    # Custom optimizer names that are handled by SFTTrainer but aren't built into Transformers
+    CUSTOM_OPTIMIZERS = {"came_pytorch"}
+
     def __post_init__(self):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
 
@@ -473,4 +500,15 @@ class SFTConfig(TrainingArguments):
                 f"Must be one of: {', '.join(sorted(valid_strategies))}"
             )
 
+        # Handle custom optimizer names before parent validation
+        # Store the original value and replace with a valid placeholder
+        self._custom_optim = None
+        if self.optim is not None and self.optim in self.CUSTOM_OPTIMIZERS:
+            self._custom_optim = self.optim
+            self.optim = "adamw_torch"  # Placeholder to pass validation
+
         super().__post_init__()
+
+        # Restore the custom optimizer name after validation
+        if self._custom_optim is not None:
+            self.optim = self._custom_optim

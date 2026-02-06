@@ -94,51 +94,53 @@ def _label(tag: str, color_codes: tuple) -> str:
 # Sample loading
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _load_one_sample_per_dataset(data_config_path: str) -> list[tuple[str, dict]]:
+def _load_one_sample_per_dataset(data_config_path: str) -> tuple[list[tuple[str, dict, DatasetConfig]], DatasetMixtureConfig]:
     """
     Load one sample from each dataset in the data config.
 
-    Returns list of (dataset_label, sample_dict) tuples.
+    Uses DatasetMixtureConfig to properly expand per-file configs
+    into individual datasets with correct data_files parameters.
+
+    Returns:
+        Tuple of (samples_list, mixture_config) where samples_list contains
+        (dataset_label, sample_dict, dataset_config) tuples.
     """
     from datasets import load_dataset
 
     with open(data_config_path) as f:
         raw = yaml.safe_load(f)
 
-    datasets_raw = raw.get("datasets", [])
-    if not datasets_raw:
+    # Use DatasetMixtureConfig to properly expand files: entries into individual DatasetConfigs
+    mixture_config = DatasetMixtureConfig(**raw)
+
+    if not mixture_config.datasets:
         raise ValueError(f"No datasets found in {data_config_path}")
 
     samples = []
-    for ds_entry in datasets_raw:
-        if isinstance(ds_entry, dict):
-            # Could be a registry reference or direct path
-            label = ds_entry.get("dataset") or ds_entry.get("path", "unknown")
-            path = ds_entry.get("path")
-            split = ds_entry.get("split", "train")
+    for ds_config in mixture_config.datasets:
+        # Build a descriptive label
+        label = ds_config.path
+        if ds_config.data_files:
+            if isinstance(ds_config.data_files, str):
+                label = f"{ds_config.path}/{ds_config.data_files}"
+            elif isinstance(ds_config.data_files, list) and len(ds_config.data_files) == 1:
+                label = f"{ds_config.path}/{ds_config.data_files[0]}"
 
-            if not path:
-                # Try registry resolution
-                from clicker.scripts.utils import _load_dataset_registry, _resolve_dataset_entry
-                registry = _load_dataset_registry()
-                resolved = _resolve_dataset_entry(ds_entry, registry)
-                path = resolved.get("path")
-                split = resolved.get("split", "train")
-                if not path:
-                    logger.warning(f"Could not resolve dataset: {ds_entry}")
-                    continue
+        try:
+            ds = load_dataset(
+                path=ds_config.path,
+                name=ds_config.name,
+                data_dir=ds_config.data_dir,
+                data_files=ds_config.data_files,
+                split=ds_config.split,
+            )
+            sample = next(iter(ds))
+            samples.append((label, sample, ds_config))
+        except Exception as e:
+            logger.warning(f"Failed to load sample from {label}: {e}")
+            samples.append((label, {"_error": str(e)}, ds_config))
 
-            try:
-                ds = load_dataset(path, split=split)
-                sample = next(iter(ds))
-                samples.append((label, sample))
-            except Exception as e:
-                logger.warning(f"Failed to load sample from {path}: {e}")
-                samples.append((label, {"_error": str(e)}))
-        else:
-            logger.warning(f"Unexpected dataset entry type: {type(ds_entry)}")
-
-    return samples
+    return samples, mixture_config
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -382,7 +384,8 @@ def debug_sample(
         if not text:
             available = [k for k in processed.keys() if not k.startswith("_")]
             warnings.append(f"Text field '{dataset_text_field}' is empty. Available: {available}")
-            lines.append(f"  {_c(f'(empty — field \"{dataset_text_field}\" not found)', _RED)}")
+            empty_msg = f'(empty — field "{dataset_text_field}" not found)'
+            lines.append(f"  {_c(empty_msg, _RED)}")
         else:
             # Show with EOS that will be added
             eos = tokenizer.eos_token or ""
@@ -469,17 +472,23 @@ def debug_sample(
     return "\n".join(lines)
 
 
-def run_debug(training_config: dict, max_display_tokens: int = 200) -> None:
+def run_debug(training_config: dict, max_display_tokens: int = 200, config_path: Optional[str] = None) -> None:
     """
     Run the debug inspector on one sample from each dataset.
 
     Args:
         training_config: Raw dict from the training YAML config.
         max_display_tokens: Max tokens to show in the token-level view.
+        config_path: Path to the training config file (for resolving relative paths).
     """
     data_config_path = training_config.get("data_config")
     if not data_config_path:
         raise ValueError("Training config must have a 'data_config' field.")
+
+    # Resolve relative data_config path relative to training config location
+    if config_path and not os.path.isabs(data_config_path):
+        config_dir = os.path.dirname(os.path.abspath(config_path))
+        data_config_path = os.path.join(config_dir, data_config_path)
 
     model_name_or_path = training_config.get("model_name_or_path")
     if not model_name_or_path:
@@ -489,10 +498,8 @@ def run_debug(training_config: dict, max_display_tokens: int = 200) -> None:
     max_length = training_config.get("max_length")
     truncation_strategy = training_config.get("truncation_strategy", "truncate")
     dataset_text_field = training_config.get("dataset_text_field", "text")
-    default_system_message = training_config.get("default_system_message")
     fix_turn_order = training_config.get("fix_turn_order", False)
     fix_turn_order_filler = training_config.get("fix_turn_order_filler", "Let's begin.")
-    assistant_only_loss = training_config.get("assistant_only_loss", False)
     last_assistant_only_loss = training_config.get("last_assistant_only_loss", False)
     train_on_incomplete_assistant = training_config.get("train_on_incomplete_assistant", False)
     chat_template_path = training_config.get("chat_template_path")
@@ -522,7 +529,17 @@ def run_debug(training_config: dict, max_display_tokens: int = 200) -> None:
 
     # Load one sample per dataset
     print(f"   Loading samples...")
-    samples = _load_one_sample_per_dataset(data_config_path)
+    samples, mixture_config = _load_one_sample_per_dataset(data_config_path)
+
+    # Get default_system_message and assistant_only_loss from data config (mixture_config)
+    # with fallback to training config
+    default_system_message = mixture_config.default_system_message or training_config.get("default_system_message")
+    assistant_only_loss = mixture_config.assistant_only_loss or training_config.get("assistant_only_loss", False)
+
+    if default_system_message:
+        print(f"   Default system message: {default_system_message[:50]}...")
+    if assistant_only_loss:
+        print(f"   Assistant-only loss: enabled")
 
     if not samples:
         print("   No samples found!")
@@ -531,24 +548,30 @@ def run_debug(training_config: dict, max_display_tokens: int = 200) -> None:
     print(f"   Found {len(samples)} dataset(s)")
 
     # Debug each sample
-    for label, sample in samples:
+    for label, sample, ds_config in samples:
         if "_error" in sample:
             print(f"\n   ⚠ Skipping {label}: {sample['_error']}")
             continue
+
+        # Use per-dataset settings if available, falling back to global config
+        sample_max_length = ds_config.max_length if ds_config.max_length is not None else max_length
+        sample_trunc_strategy = ds_config.truncation_strategy if ds_config.truncation_strategy is not None else truncation_strategy
+        sample_system_message = ds_config.system_message if ds_config.system_message is not None else default_system_message
+        sample_train_incomplete = ds_config.train_on_incomplete_assistant if ds_config.train_on_incomplete_assistant else train_on_incomplete_assistant
 
         report = debug_sample(
             sample=sample,
             tokenizer=tokenizer,
             dataset_label=label,
             dataset_text_field=dataset_text_field,
-            default_system_message=default_system_message,
+            default_system_message=sample_system_message,
             fix_turn_order=fix_turn_order,
             fix_turn_order_filler=fix_turn_order_filler,
             assistant_only_loss=assistant_only_loss,
             last_assistant_only_loss=last_assistant_only_loss,
-            train_on_incomplete_assistant=train_on_incomplete_assistant,
-            max_length=max_length,
-            truncation_strategy=truncation_strategy,
+            train_on_incomplete_assistant=sample_train_incomplete,
+            max_length=sample_max_length,
+            truncation_strategy=sample_trunc_strategy,
             max_display_tokens=max_display_tokens,
         )
         print(report)
@@ -586,7 +609,7 @@ def main():
         config = yaml.safe_load(f)
     config = resolve_config_inheritance(config, args.config)
 
-    run_debug(config, max_display_tokens=args.max_tokens)
+    run_debug(config, max_display_tokens=args.max_tokens, config_path=args.config)
 
 
 if __name__ == "__main__":

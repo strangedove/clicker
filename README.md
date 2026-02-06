@@ -267,7 +267,32 @@ test_split_size: 0.05  # Auto-split if no test set
 | `warmup_steps` | int | `0` | Number of warmup steps |
 | `weight_decay` | float | `0.0` | Weight decay for AdamW |
 | `max_grad_norm` | float | `1.0` | Max gradient norm for clipping |
-| `optim` | str | `"adamw_torch"` | Optimizer type |
+| `optim` | str | `"adamw_torch"` | Optimizer type (see [Optimizer Options](#optimizer-options)) |
+| `optim_args` | dict | `{}` | Additional arguments for the optimizer |
+
+**Optimizer options:**
+
+Clicker supports all HuggingFace optimizers plus the CAME optimizer for memory-efficient training.
+
+| Optimizer | Description |
+|-----------|-------------|
+| `adamw_torch` | PyTorch AdamW (default) |
+| `adamw_hf` | HuggingFace AdamW |
+| `adafactor` | Adafactor (memory efficient) |
+| `came_pytorch` | CAME optimizer - memory-efficient with configurable options |
+
+**CAME optimizer example:**
+
+```yaml
+optim: came_pytorch
+optim_args:
+  enable_stochastic_rounding: true   # Reduces memory, slight accuracy tradeoff
+  enable_cautious: true              # Cautious updates for stability
+  enable_cautious_weight_decay: true # Apply caution to weight decay too
+  # enable_8bit: true                # 8-bit optimizer states (experimental)
+```
+
+Install CAME: `uv pip install git+https://github.com/xzuyn/CAME.git@triton-fused`
 
 #### Evaluation & Saving
 
@@ -275,9 +300,25 @@ test_split_size: 0.05  # Auto-split if no test set
 |-----------|------|---------|-------------|
 | `eval_strategy` | str | `"no"` | Evaluation strategy: `"no"`, `"steps"`, `"epoch"` |
 | `eval_steps` | int | `500` | Evaluate every N steps |
+| `evals_per_epoch` | int | `null` | Number of evaluations per epoch (auto-calculates `eval_steps`) |
 | `save_strategy` | str | `"steps"` | Save strategy: `"no"`, `"steps"`, `"epoch"` |
 | `save_steps` | int | `500` | Save checkpoint every N steps |
+| `saves_per_epoch` | int | `null` | Number of saves per epoch (auto-calculates `save_steps`) |
 | `save_total_limit` | int | `null` | Max checkpoints to keep |
+
+**Convenience options:**
+
+Use `saves_per_epoch` and `evals_per_epoch` to automatically calculate step intervals based on your dataset size:
+
+```yaml
+# Save 3 times per epoch, evaluate 5 times per epoch
+saves_per_epoch: 3
+evals_per_epoch: 5
+eval_strategy: steps
+save_strategy: steps
+```
+
+These are converted to `save_steps` and `eval_steps` automatically based on: `steps_per_epoch = dataset_size / (batch_size * grad_accum * num_gpus)`
 
 #### Logging
 
@@ -286,6 +327,18 @@ test_split_size: 0.05  # Auto-split if no test set
 | `logging_steps` | int | `10` | Log every N steps |
 | `report_to` | list | `[]` | Reporting integrations: `["wandb"]`, `["tensorboard"]`, etc. |
 | `run_name` | str | `null` | Run name for logging |
+| `wandb_project` | str | `null` | W&B project name (sets `WANDB_PROJECT` env var) |
+
+**Weights & Biases integration:**
+
+```yaml
+report_to:
+  - wandb
+wandb_project: my-llm-training    # Sets WANDB_PROJECT automatically
+run_name: sft-experiment-1        # Run name shown in W&B dashboard
+```
+
+The `wandb_project` field is extracted and set as the `WANDB_PROJECT` environment variable before training starts. This works even with distributed training via accelerate launch.
 
 #### Hardware
 
@@ -358,6 +411,48 @@ max_length: 2048
 ```
 
 Per-dataset `truncation_strategy` can be set in the dataset mixer to override the global default.
+
+**Loss types:**
+
+| Loss Type | Description |
+|-----------|-------------|
+| `nll` | Standard negative log-likelihood (default) |
+| `dft` | Dynamic Fine-Tuning loss - improves generalization by rectifying the reward signal |
+
+```yaml
+# Example: Use DFT loss for better generalization
+loss_type: dft
+```
+
+**Auxiliary losses:**
+
+Clicker supports auxiliary loss functions that can be combined with the main loss to improve training. These are weighted and added to the cross-entropy loss.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `aux_loss_eos_weight` | float | `null` | Weight for EOS boosting loss - encourages the model to predict EOS tokens at appropriate positions |
+| `aux_loss_rep_weight` | float | `null` | Weight for repetition penalty loss - discourages token repetition within a sliding window |
+| `aux_loss_rep_window` | int | `128` | Window size for repetition penalty (number of recent tokens to check) |
+| `aux_loss_diversity_weight` | float | `null` | Weight for token diversity loss - encourages diverse vocabulary usage |
+| `aux_loss_confidence_weight` | float | `null` | Weight for confidence calibration loss - prevents overconfident predictions |
+
+```yaml
+# Example: SFT with auxiliary losses
+trainer: sft
+max_length: 4096
+
+# Main loss
+loss_type: nll
+
+# Auxiliary losses (all optional, set to null to disable)
+aux_loss_rep_weight: 0.05         # Reduce repetition
+aux_loss_rep_window: 128          # Check last 128 tokens for repetition
+aux_loss_diversity_weight: 0.05   # Encourage vocabulary diversity
+aux_loss_confidence_weight: 0.02  # Prevent overconfidence
+aux_loss_eos_weight: 0.1          # Boost EOS prediction (good for chat)
+```
+
+**Note:** Auxiliary losses are incompatible with `use_cce: true` (Cut Cross-Entropy). If you need memory savings, choose one or the other.
 
 ---
 
@@ -1409,6 +1504,8 @@ clicker train --config config.yaml --accelerate_config multi_gpu
 clicker train --config config.yaml --accelerate_config zero2
 ```
 
+**Important:** `gradient_checkpointing: true` is incompatible with DeepSpeed ZeRO-3. Use QLoRA (4-bit quantization) with regular multi-GPU DDP instead, or use ZeRO-2. See: https://github.com/huggingface/transformers/issues/25301
+
 ### FSDP (Fully Sharded Data Parallel)
 
 FSDP configs auto-detect the transformer layer class from the model's `_no_split_modules` attribute - no need to specify layer names for different architectures.
@@ -1429,7 +1526,9 @@ clicker train --config config.yaml --accelerate_config fsdp_offload
 | `multi_gpu` | Multi-GPU with DDP |
 | `zero1` | DeepSpeed ZeRO Stage 1 |
 | `zero2` | DeepSpeed ZeRO Stage 2 |
+| `zero2_offload` | DeepSpeed ZeRO Stage 2 with CPU offload |
 | `zero3` | DeepSpeed ZeRO Stage 3 |
+| `zero3_offload` | DeepSpeed ZeRO Stage 3 with CPU offload (max memory savings) |
 | `fsdp1` | FSDP with SHARD_GRAD_OP (less aggressive sharding) |
 | `fsdp2` | FSDP with FULL_SHARD (shards params, grads, optimizer) |
 | `fsdp_offload` | FSDP with CPU offload + activation checkpointing |

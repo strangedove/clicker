@@ -41,7 +41,72 @@ from .scripts.vllm_serve import make_parser as make_vllm_serve_parser
 logger = logging.get_logger(__name__)
 
 
+def _set_wandb_env_from_config(config_path: str) -> None:
+    """
+    Read wandb_project from config and set WANDB_PROJECT env var if not already set.
+
+    This allows users to specify `wandb_project: MyProject` in their training config
+    without it being parsed as a CLI argument.
+    """
+    import yaml
+
+    try:
+        with open(config_path) as f:
+            config = yaml.safe_load(f) or {}
+
+        # Also check base_config for wandb_project
+        if config.get("base_config"):
+            base_path = config["base_config"]
+            # Handle relative paths
+            if not os.path.isabs(base_path):
+                base_path = os.path.join(os.path.dirname(config_path), base_path)
+            if os.path.exists(base_path):
+                with open(base_path) as f:
+                    base_config = yaml.safe_load(f) or {}
+                # Base config values, main config overrides
+                if "wandb_project" in base_config and "wandb_project" not in config:
+                    config["wandb_project"] = base_config["wandb_project"]
+
+        # Set WANDB_PROJECT if specified in config and not already in environment
+        if config.get("wandb_project") and not os.environ.get("WANDB_PROJECT"):
+            os.environ["WANDB_PROJECT"] = config["wandb_project"]
+
+    except Exception:
+        pass  # Silently ignore errors - config will be validated later anyway
+
+
 def main():
+    # Handle commands that don't use TrlParser's config loading BEFORE the main parser
+    # These commands have their own --config argument that shouldn't be consumed by TrlParser
+    if len(sys.argv) >= 2:
+        command = sys.argv[1]
+
+        # For training commands, extract wandb_project from config and set env var
+        # This must happen before accelerate launch since env vars are inherited
+        if command in ("sft", "dpo", "grpo", "kto", "orpo", "reward", "rloo", "train"):
+            # Find --config argument
+            for i, arg in enumerate(sys.argv):
+                if arg == "--config" and i + 1 < len(sys.argv):
+                    _set_wandb_env_from_config(sys.argv[i + 1])
+                    break
+
+        if command == "blend":
+            # Blend has its own --config arg for the training config
+            blend_parser = make_blend_parser()
+            blend_args = blend_parser.parse_args(sys.argv[2:])
+            blend_main(
+                blend_args.config,
+                blend_args.output,
+                is_dry_run=blend_args.dry_run,
+                is_debug=blend_args.debug,
+                debug_max_tokens=blend_args.debug_max_tokens,
+            )
+            return
+
+        if command == "env":
+            print_env()
+            return
+
     parser = TrlParser(prog="TRL CLI", usage="trl", allow_abbrev=False)
 
     # Add the subparsers
@@ -57,7 +122,7 @@ def main():
     make_orpo_parser(subparsers)
     make_reward_parser(subparsers)
     make_rloo_parser(subparsers)
-    make_sft_parser(subparsers)
+    make_sft_parser(subparsers, include_dataset_args=False)
     make_train_parser(subparsers)
     make_vllm_serve_parser(subparsers)
 
@@ -103,6 +168,20 @@ def main():
 
         # Insert '--config_file' and the absolute path to the front of the list
         launch_args = ["--config_file", str(accelerate_config_path)] + launch_args
+
+    # Filter out custom fields from launch_args that aren't recognized by accelerate/transformers
+    # These are handled specially by the CLI or trainer
+    custom_fields_to_filter = [
+        "--wandb_project",      # Converted to WANDB_PROJECT env var
+        "--saves_per_epoch",    # Converted to save_steps in trainer
+        "--evals_per_epoch",    # Converted to eval_steps in trainer
+    ]
+    for field in custom_fields_to_filter:
+        if field in launch_args:
+            idx = launch_args.index(field)
+            launch_args.pop(idx)  # Remove the flag
+            if idx < len(launch_args) and not launch_args[idx].startswith("--"):
+                launch_args.pop(idx)  # Remove the value
 
     if args.command == "blend":
         # Blend/preprocess datasets - doesn't need accelerate launch

@@ -189,6 +189,12 @@ class FileConfig:
             Maximum sequence length for this file. Overrides the global `max_length` setting.
             Useful when you want shorter truncation for specific data (e.g., 2048 for short-form
             data while training at 4096 context).
+        type (`str`, *optional*):
+            Type of data in this file: "conversational" or "text". Overrides the dataset-level type.
+        train_on_incomplete_assistant (`bool`, *optional*):
+            If True, don't add the assistant end token (EOS) to the last assistant turn when the
+            response is incomplete (truncated). Useful for training on samples where the assistant
+            response was cut off. This per-file setting overrides the dataset-level setting.
     """
 
     file: str
@@ -200,6 +206,8 @@ class FileConfig:
     eval_split: Optional[Union[float, bool]] = None
     eval_before_subset: Optional[bool] = None
     max_length: Optional[int] = None
+    type: Optional[str] = None  # "conversational" or "text"
+    train_on_incomplete_assistant: Optional[bool] = None
 
 
 @dataclass
@@ -261,6 +269,24 @@ class DatasetConfig:
             Maximum sequence length for this dataset. Overrides the global `max_length` setting.
             Useful when you want shorter truncation for specific data (e.g., 2048 for short-form
             data while training at 4096 context).
+        type (`str`, *optional*):
+            Type of dataset: "conversational" or "text". If not specified, the format is auto-detected
+            from the data (presence of "messages" key indicates conversational).
+        files (`list[FileConfig]`, *optional*):
+            Alternative to `data_files` for per-file configuration within a single repo. Each entry
+            must have a `file` key and can override other settings per-file. Example:
+            ```yaml
+            files:
+              - file: conversations.json
+                truncation_strategy: truncate_turns
+              - file: prose.json
+                type: text
+                truncation_strategy: split
+            ```
+        train_on_incomplete_assistant (`bool`, *optional*):
+            If True, don't add the assistant end token (EOS) to the last assistant turn when the
+            response is incomplete (truncated). Useful for training on samples where the assistant
+            response was cut off. This per-dataset setting overrides the global setting.
     """
 
     path: str
@@ -276,6 +302,9 @@ class DatasetConfig:
     eval_split: Optional[Union[float, bool]] = None
     eval_before_subset: Optional[bool] = None
     max_length: Optional[int] = None
+    type: Optional[str] = None  # "conversational" or "text"
+    files: Optional[list] = None  # Alternative to data_files with per-file settings
+    train_on_incomplete_assistant: Optional[bool] = None
 
 
 def _load_dataset_registry(registry_path: Optional[str] = None) -> dict:
@@ -448,6 +477,20 @@ class DatasetMixtureConfig:
         default=42,
         metadata={"help": "Seed for train/eval splits. Separate from shuffle_seed for reproducibility."},
     )
+    default_system_message: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Default system message to add to conversational data that lacks one. "
+            "Can be overridden per-dataset with the `system_message` field."
+        },
+    )
+    assistant_only_loss: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to mask non-assistant tokens in the loss. "
+            "When True, only assistant responses contribute to the loss."
+        },
+    )
     registry: Optional[str] = field(
         default=None,
         metadata={
@@ -469,7 +512,29 @@ class DatasetMixtureConfig:
                 # Resolve registry references (dataset: name -> path: ...)
                 if "dataset" in dataset and "path" not in dataset:
                     dataset = _resolve_dataset_entry(dataset, _registry)
+                # Handle 'files' as alias for 'data_files'
+                if "files" in dataset and "data_files" not in dataset:
+                    dataset["data_files"] = dataset.pop("files")
                 dataset = DatasetConfig(**dataset)
+
+            # Handle 'files' field as alias for 'data_files' on DatasetConfig objects
+            if dataset.files is not None and dataset.data_files is None:
+                dataset = DatasetConfig(
+                    path=dataset.path,
+                    name=dataset.name,
+                    data_dir=dataset.data_dir,
+                    data_files=dataset.files,
+                    split=dataset.split,
+                    columns=dataset.columns,
+                    system_message=dataset.system_message,
+                    truncation_strategy=dataset.truncation_strategy,
+                    subset=dataset.subset,
+                    shuffle=dataset.shuffle,
+                    eval_split=dataset.eval_split,
+                    eval_before_subset=dataset.eval_before_subset,
+                    max_length=dataset.max_length,
+                    type=dataset.type,
+                )
 
             # Check if data_files contains FileConfig objects (per-file settings)
             if dataset.data_files is not None and isinstance(dataset.data_files, list):
@@ -499,6 +564,7 @@ class DatasetMixtureConfig:
                                 eval_split=file_config.eval_split if file_config.eval_split is not None else dataset.eval_split,
                                 eval_before_subset=file_config.eval_before_subset if file_config.eval_before_subset is not None else dataset.eval_before_subset,
                                 max_length=file_config.max_length if file_config.max_length is not None else dataset.max_length,
+                                type=file_config.type if file_config.type is not None else dataset.type,
                             )
                             expanded_datasets.append(expanded)
                         elif isinstance(file_item, str):
@@ -517,6 +583,7 @@ class DatasetMixtureConfig:
                                 eval_split=dataset.eval_split,
                                 eval_before_subset=dataset.eval_before_subset,
                                 max_length=dataset.max_length,
+                                type=dataset.type,
                             )
                             expanded_datasets.append(expanded)
                     continue  # Don't add the original dataset
@@ -982,12 +1049,26 @@ def _process_single_dataset(
         dataset = dataset.select_columns(dataset_config.columns)
 
     # Add per-dataset metadata columns
+    # Build a short name for the dataset (path + first data_file if any)
+    dataset_name = dataset_config.path
+    if dataset_config.data_files:
+        if isinstance(dataset_config.data_files, str):
+            dataset_name = f"{dataset_config.path}/{dataset_config.data_files}"
+        elif isinstance(dataset_config.data_files, list) and len(dataset_config.data_files) > 0:
+            first_file = dataset_config.data_files[0]
+            if isinstance(first_file, str):
+                dataset_name = f"{dataset_config.path}/{first_file}"
+    dataset = dataset.add_column("_dataset_name", [dataset_name] * len(dataset))
+
     if dataset_config.system_message is not None:
         dataset = dataset.add_column("_system_message", [dataset_config.system_message] * len(dataset))
     if dataset_config.truncation_strategy is not None:
         dataset = dataset.add_column("_truncation_strategy", [dataset_config.truncation_strategy] * len(dataset))
     if dataset_config.max_length is not None:
         dataset = dataset.add_column("_max_length", [dataset_config.max_length] * len(dataset))
+    # Mark samples that should be excluded from eval split
+    if dataset_config.eval_split is False:
+        dataset = dataset.add_column("_no_eval", [True] * len(dataset))
 
     # Resolve per-dataset settings with global defaults
     should_shuffle = dataset_config.shuffle if dataset_config.shuffle is not None else mixture_config.shuffle_datasets
@@ -1223,9 +1304,10 @@ def validate_blend_metadata(prepared_path: str, training_config: dict) -> list[s
     Compare blend metadata against the current training config.
 
     Returns a list of mismatch descriptions. Empty list means everything matches.
-    """
-    import os
 
+    Note: eval_split is read from the data_config file (not training_config)
+    since it's a data preparation setting.
+    """
     metadata = _load_blend_metadata(prepared_path)
     if metadata is None:
         return ["No blend_metadata.json found — cannot verify dataset matches config."]
@@ -1247,7 +1329,7 @@ def validate_blend_metadata(prepared_path: str, training_config: dict) -> list[s
         if config_val is not None and meta_val is not None and str(meta_val) != str(config_val):
             mismatches.append(f"  {label}: blend has '{meta_val}', config has '{config_val}'")
 
-    # Check eval_split separately (float comparison)
+    # Check eval_split separately (float comparison) - read from data_config
     meta_eval = metadata.get("eval_split", 0.0)
     config_eval = training_config.get("eval_split", 0.0)
     if abs(float(meta_eval) - float(config_eval)) > 1e-6:
@@ -1271,7 +1353,19 @@ def needs_blend(prepared_path: str) -> bool:
 def build_blend_config(training_args, model_args) -> dict:
     """
     Build the config dict that blend.prepare_dataset() expects from SFT training args.
+
+    Note: eval_split and split_seed are read from the data_config file (not training_args)
+    since they're data preparation settings that live in the data config.
     """
+    # Load eval_split and split_seed from data_config if available
+    eval_split = 0.0
+    split_seed = 42
+    if training_args.data_config and os.path.exists(training_args.data_config):
+        with open(training_args.data_config) as f:
+            data_config = yaml.safe_load(f) or {}
+        eval_split = data_config.get("eval_split", 0.0)
+        split_seed = data_config.get("split_seed", 42)
+
     config = {
         "model_name_or_path": model_args.model_name_or_path,
         "trust_remote_code": model_args.trust_remote_code,
@@ -1279,8 +1373,8 @@ def build_blend_config(training_args, model_args) -> dict:
         "max_length": training_args.max_length,
         "truncation_strategy": getattr(training_args, "truncation_strategy", "truncate"),
         "dataset_text_field": getattr(training_args, "dataset_text_field", "text"),
-        "eval_split": getattr(training_args, "eval_split", 0.0),
-        "split_seed": getattr(training_args, "split_seed", 42),
+        "eval_split": eval_split,
+        "split_seed": split_seed,
         "prepared_dataset": training_args.prepared_dataset,
     }
 

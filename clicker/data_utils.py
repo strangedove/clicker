@@ -1525,17 +1525,23 @@ def apply_truncation_strategy_to_example(
     bos_token_id = tokenizer.bos_token_id
 
     if strategy == "split":
+        result = dict(example)
+        # Ensure attention_mask is always present for consistency
+        if "attention_mask" not in result:
+            result["attention_mask"] = attention_mask
+
         if len(input_ids) <= max_length:
-            return example
+            # No splitting needed, but add empty _split_chunks for column consistency
+            result["_split_chunks"] = None
+            return result
+
         chunks = split_tokens_into_chunks(
             input_ids, attention_mask, max_length, eos_token_id, bos_token_id
         )
         # Return first chunk and store rest for expansion
-        result = dict(example)
         result["input_ids"] = chunks[0][0]
         result["attention_mask"] = chunks[0][1]
-        if len(chunks) > 1:
-            result["_split_chunks"] = chunks[1:]
+        result["_split_chunks"] = chunks[1:] if len(chunks) > 1 else None
         return result
 
     # truncate or drop
@@ -1574,6 +1580,11 @@ def expand_split_chunks(dataset: "Dataset") -> "Dataset":
     for example in dataset:
         # Add the main example (first chunk is already in input_ids)
         row = {k: v for k, v in example.items() if k != "_split_chunks"}
+
+        # Ensure attention_mask is present for the first chunk
+        if "attention_mask" not in row and "input_ids" in row:
+            row["attention_mask"] = [1] * len(row["input_ids"])
+
         expanded_rows.append(row)
 
         # Add remaining chunks
@@ -1624,6 +1635,99 @@ def mask_to_last_segment_only(mask: list[int]) -> list[int]:
     for i in range(start_idx, last_one_idx + 1):
         result[i] = 1
     return result
+
+
+def compute_assistant_mask_from_tokens(
+    input_ids: list[int],
+    processing_class,
+) -> Optional[list[int]]:
+    """
+    Compute an assistant mask based on special tokens in the input.
+
+    This is a fallback for chat templates that don't support the ``{% generation %}``
+    macro. It looks for common assistant start/end token patterns:
+    - <|assistant_start|> / <|assistant_end|>
+    - <|im_start|>assistant / <|im_end|>
+    - [/INST] / </s> (Llama-2 style)
+    - <|start_header_id|>assistant / <|eot_id|> (Llama-3 style)
+
+    Args:
+        input_ids: Token IDs from the tokenized sequence.
+        processing_class: Tokenizer to get special token IDs.
+
+    Returns:
+        A list of 0/1 where 1 = assistant token (train), 0 = non-assistant (mask).
+        Returns None if no assistant tokens can be detected.
+    """
+    # Try to find assistant start/end token IDs from the tokenizer's vocabulary
+    vocab = processing_class.get_vocab() if hasattr(processing_class, "get_vocab") else {}
+
+    # Common patterns for assistant start tokens
+    assistant_start_patterns = [
+        "<|assistant_start|>",
+        "<|assistant|>",
+        "<|start_header_id|>",  # Llama-3 uses this followed by assistant text
+    ]
+    # Common patterns for assistant end tokens
+    assistant_end_patterns = [
+        "<|assistant_end|>",
+        "<|eot_id|>",
+        "<|im_end|>",
+        "<|end|>",
+    ]
+    # Also check for tokens that mark other roles (to end assistant segments)
+    role_start_patterns = [
+        "<|user_start|>",
+        "<|user|>",
+        "<|system_start|>",
+        "<|system|>",
+        "<|developer_start|>",
+        "<|tool_start|>",
+    ]
+
+    assistant_start_ids = set()
+    assistant_end_ids = set()
+    role_start_ids = set()
+
+    for pattern in assistant_start_patterns:
+        if pattern in vocab:
+            assistant_start_ids.add(vocab[pattern])
+
+    for pattern in assistant_end_patterns:
+        if pattern in vocab:
+            assistant_end_ids.add(vocab[pattern])
+
+    for pattern in role_start_patterns:
+        if pattern in vocab:
+            role_start_ids.add(vocab[pattern])
+
+    # If we can't find the special tokens, we can't compute the mask
+    if not assistant_start_ids:
+        return None
+
+    # Build the mask
+    mask = [0] * len(input_ids)
+    in_assistant = False
+
+    for i, token_id in enumerate(input_ids):
+        if token_id in assistant_start_ids:
+            # Start of assistant turn - mark AFTER this token
+            in_assistant = True
+            # Don't include the start token itself
+        elif token_id in assistant_end_ids:
+            # End of assistant turn - include up to but not including this token
+            in_assistant = False
+        elif token_id in role_start_ids:
+            # Another role started, end assistant segment
+            in_assistant = False
+        elif in_assistant:
+            mask[i] = 1
+
+    # If we found at least some assistant tokens, return the mask
+    if sum(mask) > 0:
+        return mask
+
+    return None
 
 
 def remove_trailing_eos(input_ids: list[int], eos_token_id: int) -> list[int]:
@@ -1695,6 +1799,16 @@ def tokenize_sft_example(
             prompt_completion_ids = prompt_completion_processed["input_ids"]
             if "assistant_masks" in prompt_completion_processed:
                 output["assistant_masks"] = prompt_completion_processed["assistant_masks"]
+            # Fallback for prompt-completion: compute mask from special tokens if template
+            # doesn't support {% generation %}
+            if need_assistant_masks:
+                asst_masks = output.get("assistant_masks", [])
+                if not asst_masks or sum(asst_masks) == 0:
+                    fallback_mask = compute_assistant_mask_from_tokens(
+                        prompt_completion_ids, processing_class
+                    )
+                    if fallback_mask is not None:
+                        output["assistant_masks"] = fallback_mask
         else:
             prompt_ids = processing_class(text=example["prompt"])["input_ids"]
             prompt_completion_ids = processing_class(text=example["prompt"] + example["completion"])["input_ids"]
@@ -1715,6 +1829,17 @@ def tokenize_sft_example(
             )
             processed = {k: v[0] if isinstance(v[0], list) else v for k, v in processed.items()}
             output = {k: processed[k] for k in ("input_ids", "assistant_masks") if k in processed}
+
+            # Fallback: if assistant_masks is all zeros (template doesn't support {% generation %}),
+            # compute the mask from special tokens
+            if need_assistant_masks:
+                asst_masks = output.get("assistant_masks", [])
+                if not asst_masks or sum(asst_masks) == 0:
+                    fallback_mask = compute_assistant_mask_from_tokens(
+                        output["input_ids"], processing_class
+                    )
+                    if fallback_mask is not None:
+                        output["assistant_masks"] = fallback_mask
         else:
             output = {"input_ids": processing_class(text=example[dataset_text_field])["input_ids"]}
 
@@ -1759,8 +1884,13 @@ def apply_truncation_to_dataset(
         If the dataset has a ``_max_length`` column, per-example max_length overrides
         are used. This allows different datasets in a blend to have different truncation
         lengths (e.g., 2048 for short-form data while training at 4096 context).
+
+        If the dataset has a ``_truncation_strategy`` column, per-example strategy
+        overrides are used. This allows different datasets in a blend to have different
+        truncation strategies (e.g., split for prose, truncate for chat).
     """
     import logging as _logging
+    from datasets import concatenate_datasets
 
     _logger = _logging.getLogger(__name__)
 
@@ -1771,9 +1901,55 @@ def apply_truncation_to_dataset(
     if strategy == "truncate_turns":
         strategy = "truncate"  # already handled pre-tokenization
 
-    # Check if per-example max_length is available
+    # Check if per-example settings are available
     has_per_example_max_length = "_max_length" in dataset.column_names
+    has_per_example_strategy = "_truncation_strategy" in dataset.column_names
 
+    # If we have per-example strategies, split dataset by strategy and process each separately
+    if has_per_example_strategy:
+        # Get unique strategies in the dataset
+        strategies_in_data = set(dataset["_truncation_strategy"])
+        # Map truncate_turns to truncate (already handled pre-tokenization)
+        strategies_in_data = {s if s != "truncate_turns" else "truncate" for s in strategies_in_data if s is not None}
+        # Add None -> use default strategy
+        if None in set(dataset["_truncation_strategy"]):
+            strategies_in_data.add(strategy)
+
+        result_datasets = []
+        for strat in strategies_in_data:
+            # Filter to samples with this strategy (or None -> default)
+            if strat == strategy:
+                # Include samples with this strategy OR with None (default)
+                subset_indices = [
+                    i for i, s in enumerate(dataset["_truncation_strategy"])
+                    if s == strat or s is None or (s == "truncate_turns" and strat == "truncate")
+                ]
+            else:
+                subset_indices = [
+                    i for i, s in enumerate(dataset["_truncation_strategy"])
+                    if s == strat or (s == "truncate_turns" and strat == "truncate")
+                ]
+
+            if not subset_indices:
+                continue
+
+            subset = dataset.select(subset_indices)
+            # Remove the _truncation_strategy column before processing
+            subset = subset.remove_columns(["_truncation_strategy"])
+
+            _logger.info(f"Applying {strat} strategy to {len(subset):,} samples")
+
+            # Recursively apply truncation with the specific strategy
+            processed = apply_truncation_to_dataset(
+                subset, processing_class, max_length, strategy=strat, num_proc=num_proc
+            )
+            result_datasets.append(processed)
+
+        if result_datasets:
+            return concatenate_datasets(result_datasets)
+        return dataset
+
+    # Standard path: single strategy for all samples
     if strategy == "drop":
         original_len = len(dataset)
         if has_per_example_max_length:
