@@ -224,12 +224,21 @@ def main(script_args, training_args, model_args, dataset_args):
     else:
         raise ValueError("Either `prepared_dataset`, `datasets`, or `dataset_name` must be provided.")
 
+    # Determine if we should pass eval dataset to trainer
+    # Check for: explicit eval_strategy, OR evals_per_epoch (which will set eval_strategy in trainer init)
+    has_eval_split = script_args.dataset_test_split in dataset
+    wants_eval = (
+        training_args.eval_strategy != "no"
+        or (hasattr(training_args, "evals_per_epoch") and training_args.evals_per_epoch is not None and training_args.evals_per_epoch > 0)
+    )
+    eval_dataset = dataset[script_args.dataset_test_split] if has_eval_split and wants_eval else None
+
     # Initialize the SFT trainer
     trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        eval_dataset=eval_dataset,
         peft_config=get_peft_config(model_args),
     )
 

@@ -325,6 +325,8 @@ def tokenize_dataset(
             def truncate_turns_fn(example, tokenizer, default_max_length, default_strategy):
                 # Get strategy without popping - we need to preserve it for non-truncate_turns samples
                 strategy = example.get("_truncation_strategy") or default_strategy
+                # Always set _truncation_drop to ensure consistent schema across all workers
+                example["_truncation_drop"] = False
                 if strategy != "truncate_turns":
                     return example
                 # For truncate_turns samples, mark as handled by setting strategy to "truncate"
@@ -496,6 +498,14 @@ def prepare_dataset(
 
     Returns:
         Tuple of (DatasetDict with "train" and optionally "test" splits, PipelineStats).
+
+    Config value precedence (highest to lowest):
+      1. training_config (main training config, after base_config inheritance)
+      2. data_config file
+      3. hardcoded defaults
+
+    This allows users to set defaults in data_config (tied to the dataset) while
+    overriding specific values in the main training config for experiments.
     """
     stats = PipelineStats()
 
@@ -511,22 +521,36 @@ def prepare_dataset(
     if not model_name_or_path:
         raise ValueError("Training config must have 'model_name_or_path'.")
 
+    # Load data_config for fallback values
+    data_config_values = {}
+    if os.path.exists(data_config_path):
+        with open(data_config_path) as f:
+            data_config_values = yaml.safe_load(f) or {}
+
+    # Helper to get value with precedence: training_config > data_config > default
+    def get_with_precedence(key, default=None):
+        if key in training_config and training_config[key] is not None:
+            return training_config[key]
+        if key in data_config_values and data_config_values[key] is not None:
+            return data_config_values[key]
+        return default
+
     trust_remote_code = training_config.get("trust_remote_code", False)
     max_length = training_config.get("max_length", 1024)
     truncation_strategy = training_config.get("truncation_strategy", "truncate")
     dataset_text_field = training_config.get("dataset_text_field", "text")
-    eval_split = training_config.get("eval_split", 0.0)
-    split_seed = training_config.get("split_seed", 42)
+    eval_split = get_with_precedence("eval_split", 0.0)
+    split_seed = get_with_precedence("split_seed", 42)
 
-    # Preprocessing options
-    default_system_message = training_config.get("default_system_message")
-    fix_turn_order = training_config.get("fix_turn_order", False)
-    fix_turn_order_filler = training_config.get("fix_turn_order_filler", "Let's begin.")
-    assistant_only_loss = training_config.get("assistant_only_loss", False)
-    last_assistant_only_loss = training_config.get("last_assistant_only_loss", False)
-    train_on_incomplete_assistant = training_config.get("train_on_incomplete_assistant", False)
-    num_proc = training_config.get("dataset_num_proc")
-    chat_template_path = training_config.get("chat_template_path")
+    # Preprocessing options (support data_config fallback)
+    default_system_message = get_with_precedence("default_system_message")
+    fix_turn_order = get_with_precedence("fix_turn_order", False)
+    fix_turn_order_filler = get_with_precedence("fix_turn_order_filler", "Let's begin.")
+    assistant_only_loss = get_with_precedence("assistant_only_loss", False)
+    last_assistant_only_loss = get_with_precedence("last_assistant_only_loss", False)
+    train_on_incomplete_assistant = get_with_precedence("train_on_incomplete_assistant", False)
+    num_proc = get_with_precedence("dataset_num_proc")
+    chat_template_path = get_with_precedence("chat_template_path")
 
     print("\n🍹 Starting the blender...")
     print(f"   Config: max_length={max_length}, strategy={truncation_strategy}, "
@@ -739,12 +763,59 @@ def save_prepared_dataset(
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
+    # Compute token statistics
+    def count_tokens(dataset):
+        """Count total tokens and trainable tokens in a dataset."""
+        total_tokens = 0
+        trainable_tokens = 0
+        has_assistant_masks = "assistant_masks" in dataset.column_names
+
+        for example in dataset:
+            input_ids = example.get("input_ids", [])
+            total_tokens += len(input_ids)
+
+            if has_assistant_masks:
+                # assistant_masks: 1 = trainable (assistant), 0 = not trainable
+                trainable_tokens += sum(example.get("assistant_masks", []))
+            else:
+                # No assistant masking - all tokens are trainable
+                trainable_tokens += len(input_ids)
+
+        return total_tokens, trainable_tokens
+
+    train_tokens, train_trainable = count_tokens(dataset_dict["train"])
+    if "test" in dataset_dict:
+        eval_tokens, eval_trainable = count_tokens(dataset_dict["test"])
+    else:
+        eval_tokens, eval_trainable = 0, 0
+
+    # Add token stats to metadata
+    metadata["token_stats"] = {
+        "train_total_tokens": train_tokens,
+        "train_trainable_tokens": train_trainable,
+        "eval_total_tokens": eval_tokens,
+        "eval_trainable_tokens": eval_trainable,
+    }
+
+    # Re-save metadata with token stats
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
     # Final summary
     train_count = metadata["splits"].get("train", 0)
     eval_count = metadata["splits"].get("test", 0)
     total_count = train_count + eval_count
     print(f"\n✅ Dataset ready! {total_count:,} total ({train_count:,} train, {eval_count:,} eval)")
     print(f"   Saved to {output_dir}")
+
+    # Token statistics
+    total_tokens = train_tokens + eval_tokens
+    total_trainable = train_trainable + eval_trainable
+    print(f"\n📊 Token statistics:")
+    print(f"   Train: {train_tokens:,} tokens ({train_trainable:,} trainable)")
+    if eval_tokens > 0:
+        print(f"   Eval:  {eval_tokens:,} tokens ({eval_trainable:,} trainable)")
+    print(f"   Total: {total_tokens:,} tokens ({total_trainable:,} trainable)")
 
 
 def dry_run(training_config: dict) -> None:
@@ -756,6 +827,8 @@ def dry_run(training_config: dict) -> None:
     - Estimated chunk counts (for split strategy)
     - Eval split sizes
     - Estimated output disk usage
+
+    Config value precedence: training_config > data_config > defaults
     """
     import math
 
@@ -767,11 +840,25 @@ def dry_run(training_config: dict) -> None:
     if not model_name_or_path:
         raise ValueError("Training config must have 'model_name_or_path'.")
 
+    # Load data_config for fallback values
+    data_config_values = {}
+    if os.path.exists(data_config_path):
+        with open(data_config_path) as f:
+            data_config_values = yaml.safe_load(f) or {}
+
+    # Helper to get value with precedence: training_config > data_config > default
+    def get_with_precedence(key, default=None):
+        if key in training_config and training_config[key] is not None:
+            return training_config[key]
+        if key in data_config_values and data_config_values[key] is not None:
+            return data_config_values[key]
+        return default
+
     trust_remote_code = training_config.get("trust_remote_code", False)
     max_length = training_config.get("max_length", 1024)
     truncation_strategy = training_config.get("truncation_strategy", "truncate")
     dataset_text_field = training_config.get("dataset_text_field", "text")
-    eval_split = training_config.get("eval_split", 0.0)
+    eval_split = get_with_precedence("eval_split", 0.0)
     model_short = os.path.basename(model_name_or_path.rstrip("/")) if "/" in model_name_or_path else model_name_or_path
 
     print("\n🔍 Dry run — showing what blend would produce\n")
