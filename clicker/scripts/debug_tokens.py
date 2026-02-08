@@ -423,6 +423,7 @@ def debug_sample(
         lines.append(f"  {_c(f'ERROR during tokenization: {e}', _RED)}")
         warnings.append(f"Tokenization failed: {e}")
         tokenized = None
+        import traceback; traceback.print_exc()
 
     if tokenized:
         input_ids = tokenized["input_ids"]
@@ -459,7 +460,6 @@ def debug_sample(
 
         lines.append("")
         lines.append(_format_token_view(input_ids, loss_mask, tokenizer, max_display_tokens=max_display_tokens))
-
     # 5. Warnings
     if warnings:
         lines.append("")

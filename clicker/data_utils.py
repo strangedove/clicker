@@ -1535,12 +1535,26 @@ def apply_truncation_strategy_to_example(
             result["_split_chunks"] = None
             return result
 
+        # Get assistant_masks if present (for splitting alongside input_ids)
+        assistant_masks = example.get("assistant_masks")
+
         chunks = split_tokens_into_chunks(
             input_ids, attention_mask, max_length, eos_token_id, bos_token_id
         )
         # Return first chunk and store rest for expansion
         result["input_ids"] = chunks[0][0]
         result["attention_mask"] = chunks[0][1]
+
+        # Split assistant_masks if present
+        if assistant_masks is not None:
+            # Split assistant_masks using the same chunk boundaries
+            mask_chunks = split_tokens_into_chunks(
+                assistant_masks, attention_mask, max_length, eos_token_id, bos_token_id
+            )
+            result["assistant_masks"] = mask_chunks[0][0]
+            # Store mask chunks alongside token chunks for expansion
+            result["_split_mask_chunks"] = mask_chunks[1:] if len(mask_chunks) > 1 else None
+
         result["_split_chunks"] = chunks[1:] if len(chunks) > 1 else None
         return result
 
@@ -1554,9 +1568,16 @@ def apply_truncation_strategy_to_example(
     result = dict(example)
     result["input_ids"] = truncated[0]
     result["attention_mask"] = truncated[1]
+    truncated_len = len(truncated[0])
+
     # Also truncate labels if present
-    if "labels" in result and len(result["labels"]) > len(truncated[0]):
-        result["labels"] = result["labels"][: len(truncated[0])]
+    if "labels" in result and len(result["labels"]) > truncated_len:
+        result["labels"] = result["labels"][:truncated_len]
+
+    # Also truncate assistant_masks if present
+    if "assistant_masks" in result and len(result["assistant_masks"]) > truncated_len:
+        result["assistant_masks"] = result["assistant_masks"][:truncated_len]
+
     return result
 
 
@@ -1576,10 +1597,12 @@ def expand_split_chunks(dataset: "Dataset") -> "Dataset":
     if "_split_chunks" not in dataset.column_names:
         return dataset
 
+    has_mask_chunks = "_split_mask_chunks" in dataset.column_names
+
     expanded_rows = []
     for example in dataset:
         # Add the main example (first chunk is already in input_ids)
-        row = {k: v for k, v in example.items() if k != "_split_chunks"}
+        row = {k: v for k, v in example.items() if not k.startswith("_split_")}
 
         # Ensure attention_mask is present for the first chunk
         if "attention_mask" not in row and "input_ids" in row:
@@ -1589,14 +1612,19 @@ def expand_split_chunks(dataset: "Dataset") -> "Dataset":
 
         # Add remaining chunks
         chunks = example.get("_split_chunks")
+        mask_chunks = example.get("_split_mask_chunks") if has_mask_chunks else None
+
         if chunks:
-            for chunk_ids, chunk_mask in chunks:
+            for i, (chunk_ids, chunk_mask) in enumerate(chunks):
                 chunk_row = dict(row)
                 chunk_row["input_ids"] = chunk_ids
                 chunk_row["attention_mask"] = chunk_mask
                 if "labels" in chunk_row:
                     # For split chunks, labels = input_ids (full sequence loss)
                     chunk_row["labels"] = chunk_ids
+                # Handle assistant_masks chunks if present
+                if mask_chunks and i < len(mask_chunks):
+                    chunk_row["assistant_masks"] = mask_chunks[i][0]
                 expanded_rows.append(chunk_row)
 
     # Reconstruct dataset
@@ -1729,6 +1757,43 @@ def compute_assistant_mask_from_tokens(
 
     return None
 
+def compute_assistant_mask_from_messages(
+    messages: list[dict[str, str]],
+    tokenizer,
+    **template_kwargs,
+) -> list[int]:
+    """
+    Compute an assistant mask by tokenizing the conversation turn-by-turn.
+    This is much more robust than token-matching as it uses the template logic.
+    """
+    # 1. Get the full tokenized sequence
+    full_ids = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=False, **template_kwargs
+    )
+    mask = [0] * len(full_ids)
+
+    # 2. Iterate through messages and find assistant turns
+    for i, msg in enumerate(messages):
+        role = msg.get("role") or msg.get("from", "")
+        if role.lower() in ("assistant", "gpt"):
+            # Find where this assistant turn starts
+            # Prefix is everything before this message + the generation prompt (header)
+            prefix_ids = tokenizer.apply_chat_template(
+                messages[:i], tokenize=True, add_generation_prompt=True, **template_kwargs
+            )
+            # Find where this assistant turn ends
+            # Context is everything up to and including this message
+            full_turn_ids = tokenizer.apply_chat_template(
+                messages[:i+1], tokenize=True, add_generation_prompt=False, **template_kwargs
+            )
+            
+            start_idx = len(prefix_ids)
+            end_idx = len(full_turn_ids)
+            # Ensure we don't go out of bounds (templates can be tricky with EOS)
+            for j in range(start_idx, min(end_idx, len(mask))):
+                mask[j] = 1
+
+    return mask
 
 def remove_trailing_eos(input_ids: list[int], eos_token_id: int) -> list[int]:
     """Remove trailing EOS token(s) from *input_ids*."""
@@ -1799,23 +1864,17 @@ def tokenize_sft_example(
             prompt_completion_ids = prompt_completion_processed["input_ids"]
             if "assistant_masks" in prompt_completion_processed:
                 output["assistant_masks"] = prompt_completion_processed["assistant_masks"]
-            # Fallback for prompt-completion: compute mask from special tokens if template
-            # doesn't support {% generation %}
+
+            # BETTER FALLBACK: If mask is missing or all zeros, compute from messages
             if need_assistant_masks:
                 asst_masks = output.get("assistant_masks", [])
                 if not asst_masks or sum(asst_masks) == 0:
-                    fallback_mask = compute_assistant_mask_from_tokens(
-                        prompt_completion_ids, processing_class
+                    # Use the new robust message-based computation
+                    output["assistant_masks"] = compute_assistant_mask_from_messages(
+                        example["messages"],
+                        processing_class,
+                        **example.get("chat_template_kwargs", {})
                     )
-                    if fallback_mask is not None:
-                        output["assistant_masks"] = fallback_mask
-        else:
-            prompt_ids = processing_class(text=example["prompt"])["input_ids"]
-            prompt_completion_ids = processing_class(text=example["prompt"] + example["completion"])["input_ids"]
-
-        completion_mask = [0] * len(prompt_ids) + [1] * (len(prompt_completion_ids) - len(prompt_ids))
-        output["input_ids"] = prompt_completion_ids
-        output["completion_mask"] = completion_mask
 
     else:  # language modeling case
         if is_conversational(example):
@@ -1830,18 +1889,16 @@ def tokenize_sft_example(
             processed = {k: v[0] if isinstance(v[0], list) else v for k, v in processed.items()}
             output = {k: processed[k] for k in ("input_ids", "assistant_masks") if k in processed}
 
-            # Fallback: if assistant_masks is all zeros (template doesn't support {% generation %}),
-            # compute the mask from special tokens
+            # Fallback: if mask is missing or all zeros, compute from messages
             if need_assistant_masks:
                 asst_masks = output.get("assistant_masks", [])
                 if not asst_masks or sum(asst_masks) == 0:
-                    fallback_mask = compute_assistant_mask_from_tokens(
-                        output["input_ids"], processing_class
+                    # Use the new robust message-based computation
+                    output["assistant_masks"] = compute_assistant_mask_from_messages(
+                        example["messages"],
+                        processing_class,
+                        **example.get("chat_template_kwargs", {})
                     )
-                    if fallback_mask is not None:
-                        output["assistant_masks"] = fallback_mask
-        else:
-            output = {"input_ids": processing_class(text=example[dataset_text_field])["input_ids"]}
 
     # Apply last_assistant_only_loss: mask all but the last assistant turn
     if last_assistant_only_loss and "assistant_masks" in output:
