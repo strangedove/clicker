@@ -344,6 +344,17 @@ class SFTConfig(TrainingArguments):
             )
         },
     )
+    label_smoothing: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Label smoothing factor for the cross-entropy loss. When > 0, redistributes this fraction of "
+                "probability mass from the target token uniformly across all tokens, acting as a confidence "
+                "penalty that prevents overconfident predictions. Applied directly via nn.functional.cross_entropy. "
+                "Only used with `loss_type='nll'`. Typical values: 0.05-0.1."
+            )
+        },
+    )
     # Auxiliary loss weights (0.0 = disabled, added on top of the primary loss_type)
     aux_loss_eos_weight: float = field(
         default=0.0,
@@ -403,6 +414,17 @@ class SFTConfig(TrainingArguments):
                 "Weight for the confidence regularization auxiliary loss. When > 0, penalizes the model for "
                 "being too confident (low entropy) on predictions. Acts as a targeted label smoothing that "
                 "prevents overconfident predictions while maintaining calibration. Typical values: 0.01-0.05."
+            )
+        },
+    )
+    aux_loss_top_prob_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Weight for the top-probability confidence penalty auxiliary loss. When > 0, directly penalizes "
+                "the model's peak (max) probability at each position. A sharper alternative to entropy-based "
+                "confidence regularization — targets only the single highest probability token rather than the "
+                "full distribution shape. Typical values: 0.01-0.1."
             )
         },
     )
@@ -474,6 +496,23 @@ class SFTConfig(TrainingArguments):
             "help": "Number of times to evaluate per epoch. If set, automatically calculates eval_steps based on "
             "total training steps. Mutually exclusive with eval_steps when > 0. For example, evals_per_epoch=4 "
             "will evaluate 4 times per epoch."
+        },
+    )
+
+    # Eval split settings (can also be specified in data_config; training config takes precedence)
+    eval_split: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Fraction of the dataset to use for evaluation (0.0 to 1.0). Applied after tokenization "
+            "during blend. If specified here, overrides the value in data_config. Set to 0 to disable eval split. "
+            "Example: eval_split=0.05 reserves 5% of samples for evaluation."
+        },
+    )
+    split_seed: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Random seed for the train/eval split. If specified here, overrides the value in data_config. "
+            "Use a fixed seed for reproducible splits across runs. Default (when not set anywhere): 42."
         },
     )
 

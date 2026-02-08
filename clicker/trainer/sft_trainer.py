@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import math
 import os
 from collections import defaultdict
 from dataclasses import dataclass
@@ -554,6 +555,32 @@ def dft_loss(outputs, labels, num_items_in_batch=None):
     return loss
 
 
+def nll_loss_with_label_smoothing(outputs, labels, num_items_in_batch=None, label_smoothing=0.0):
+    """
+    Standard NLL loss with label smoothing applied via nn.functional.cross_entropy.
+
+    Label smoothing redistributes a fraction of the probability mass from the target token
+    to all other tokens, acting as a confidence penalty that prevents overconfident predictions.
+    """
+    shift_logits = outputs.logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    loss_mask = shift_labels != -100
+
+    per_token_loss = nn.functional.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        label_smoothing=label_smoothing,
+        ignore_index=-100,
+        reduction="none",
+    )
+
+    if num_items_in_batch is None:
+        num_items_in_batch = loss_mask.sum()
+
+    loss = per_token_loss.sum() / num_items_in_batch
+    return loss
+
+
 def aux_eos_calibration_loss(logits, labels, assistant_masks, eos_token_id):
     """
     EOS calibration auxiliary loss.
@@ -739,15 +766,15 @@ def aux_confidence_regularization_loss(logits, labels):
     some uncertainty rather than collapsing to point predictions.
 
     Unlike generic label smoothing, this only applies at positions where we compute loss
-    (respecting the existing masking). The loss is the negative entropy of the predicted
-    distribution, so maximizing entropy = minimizing this loss.
+    (respecting the existing masking). The loss is (max_entropy - mean_entropy), which is
+    always non-negative and reaches zero when the distribution is uniform.
 
     Args:
         logits: Model logits, shape (batch, seq_len, vocab_size)
         labels: Shifted labels, shape (batch, seq_len), -100 for masked positions
 
     Returns:
-        Scalar loss (negative mean entropy at trainable positions).
+        Scalar loss (max_entropy - mean_entropy at trainable positions), always >= 0.
     """
     shift_logits = logits[..., :-1, :].contiguous()
     shift_labels = labels[..., 1:].contiguous()
@@ -761,9 +788,45 @@ def aux_confidence_regularization_loss(logits, labels):
     probs = log_probs.exp()
     per_token_entropy = -(probs * log_probs).sum(dim=-1)  # (batch, seq_len)
 
-    # The loss is negative entropy (we want to maximize entropy = minimize negative entropy)
-    neg_entropy = -per_token_entropy
-    loss = (neg_entropy * loss_mask.float()).sum() / loss_mask.sum()
+    # Loss = log(V) - mean(H): always >= 0, zero when uniform, high when overconfident.
+    # log(V) is the maximum possible entropy (uniform distribution over vocab).
+    # Since it's a constant w.r.t. model params, the gradient is the same as minimizing -H.
+    vocab_size = shift_logits.size(-1)
+    max_entropy = math.log(vocab_size)
+    mean_entropy = (per_token_entropy * loss_mask.float()).sum() / loss_mask.sum()
+    loss = max_entropy - mean_entropy
+    return loss
+
+
+def aux_top_prob_penalty_loss(logits, labels):
+    """
+    Top-probability confidence penalty auxiliary loss.
+
+    Directly penalizes the model's peak (max) probability at each trainable position.
+    Unlike entropy-based confidence regularization, this targets only the single highest
+    probability token — making it a sharper, more direct anti-overconfidence signal.
+
+    The loss value ranges from 1/V (uniform distribution) to 1.0 (point mass), so it
+    is always non-negative.
+
+    Args:
+        logits: Model logits, shape (batch, seq_len, vocab_size)
+        labels: Shifted labels, shape (batch, seq_len), -100 for masked positions
+
+    Returns:
+        Scalar loss (mean top probability at trainable positions), always in [1/V, 1.0].
+    """
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    loss_mask = shift_labels != -100
+
+    if not loss_mask.any():
+        return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
+    probs = torch.softmax(shift_logits, dim=-1)
+    top_prob = probs.max(dim=-1).values  # (batch, seq_len)
+
+    loss = (top_prob * loss_mask.float()).sum() / loss_mask.sum()
     return loss
 
 
@@ -1148,13 +1211,30 @@ class SFTTrainer(BaseTrainer):
 
         # Loss function
         if args.loss_type == "nll":
-            pass  # use the default loss
+            if (args.label_smoothing or 0) > 0:
+                if compute_loss_func is not None:
+                    raise ValueError(
+                        "You passed a `compute_loss_func` together with `label_smoothing > 0` to the `SFTTrainer`. "
+                        "When using label smoothing, the loss function is internally set, so passing a "
+                        "`compute_loss_func` is not allowed."
+                    )
+                from functools import partial
+
+                compute_loss_func = partial(
+                    nll_loss_with_label_smoothing, label_smoothing=args.label_smoothing
+                )
+                logger.info(f"Label smoothing enabled (factor={args.label_smoothing})")
         elif args.loss_type == "dft":
             if compute_loss_func is not None:
                 raise ValueError(
                     "You passed a `compute_loss_func` together with `loss_type='dft'` to the `SFTTrainer`. "
                     "When using `loss_type='dft'`, the loss function is internally set to the DFT loss, so passing a "
                     "`compute_loss_func` is not allowed."
+                )
+            if (args.label_smoothing or 0) > 0:
+                logger.warning(
+                    "label_smoothing is set but loss_type='dft'. Label smoothing is only applied with "
+                    "loss_type='nll' and will be ignored."
                 )
             compute_loss_func = dft_loss
         else:
@@ -1166,6 +1246,7 @@ class SFTTrainer(BaseTrainer):
             or (args.aux_loss_rep_weight or 0) > 0
             or (args.aux_loss_diversity_weight or 0) > 0
             or (args.aux_loss_confidence_weight or 0) > 0
+            or (args.aux_loss_top_prob_weight or 0) > 0
         )
         if has_any_aux_loss and (args.use_liger_kernel or args.use_cce):
             logger.warning(
@@ -1186,6 +1267,8 @@ class SFTTrainer(BaseTrainer):
             logger.info(f"Vocabulary diversity loss enabled (weight={args.aux_loss_diversity_weight})")
         if (args.aux_loss_confidence_weight or 0) > 0:
             logger.info(f"Confidence regularization loss enabled (weight={args.aux_loss_confidence_weight})")
+        if (args.aux_loss_top_prob_weight or 0) > 0:
+            logger.info(f"Top-probability penalty loss enabled (weight={args.aux_loss_top_prob_weight})")
 
         # Convert saves_per_epoch and evals_per_epoch to save_steps and eval_steps
         # This must happen before super().__init__() so the TrainingArguments are set correctly
@@ -1454,6 +1537,8 @@ class SFTTrainer(BaseTrainer):
                         def truncate_turns_fn(example, tokenizer, max_length, default_strategy):
                             # Per-dataset strategy overrides global
                             strategy = example.pop("_truncation_strategy", None) or default_strategy
+                            # Always set _truncation_drop to ensure consistent schema across all workers
+                            example["_truncation_drop"] = False
                             if strategy != "truncate_turns":
                                 return example  # Will be handled post-tokenization
                             truncated = truncate_conversation_by_turns(
@@ -1802,6 +1887,7 @@ class SFTTrainer(BaseTrainer):
                 or (self.args.aux_loss_rep_weight or 0) > 0
                 or (self.args.aux_loss_diversity_weight or 0) > 0
                 or (self.args.aux_loss_confidence_weight or 0) > 0
+                or (self.args.aux_loss_top_prob_weight or 0) > 0
             )
             if has_any_aux:
                 # EOS calibration
@@ -1837,6 +1923,14 @@ class SFTTrainer(BaseTrainer):
                     loss = loss + self.args.aux_loss_confidence_weight * conf_loss
                     self._metrics[mode]["aux_loss_confidence"].append(
                         self.accelerator.gather_for_metrics(conf_loss.detach()).mean().item()
+                    )
+
+                # Top-probability penalty
+                if (self.args.aux_loss_top_prob_weight or 0) > 0:
+                    top_prob_loss = aux_top_prob_penalty_loss(logits, labels)
+                    loss = loss + self.args.aux_loss_top_prob_weight * top_prob_loss
+                    self._metrics[mode]["aux_loss_top_prob"].append(
+                        self.accelerator.gather_for_metrics(top_prob_loss.detach()).mean().item()
                     )
 
         # Compute entropy

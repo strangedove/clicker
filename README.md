@@ -424,17 +424,33 @@ Per-dataset `truncation_strategy` can be set in the dataset mixer to override th
 loss_type: dft
 ```
 
-**Auxiliary losses:**
+**Label smoothing:**
 
-Clicker supports auxiliary loss functions that can be combined with the main loss to improve training. These are weighted and added to the cross-entropy loss.
+Label smoothing redistributes a fraction of probability mass from the target token uniformly across all tokens during cross-entropy computation, acting as a built-in confidence penalty. Only used with `loss_type: nll`.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `aux_loss_eos_weight` | float | `null` | Weight for EOS boosting loss - encourages the model to predict EOS tokens at appropriate positions |
-| `aux_loss_rep_weight` | float | `null` | Weight for repetition penalty loss - discourages token repetition within a sliding window |
-| `aux_loss_rep_window` | int | `128` | Window size for repetition penalty (number of recent tokens to check) |
-| `aux_loss_diversity_weight` | float | `null` | Weight for token diversity loss - encourages diverse vocabulary usage |
-| `aux_loss_confidence_weight` | float | `null` | Weight for confidence calibration loss - prevents overconfident predictions |
+| `label_smoothing` | float | `0.0` | Label smoothing factor (0.0 = disabled). Typical values: 0.05-0.1 |
+
+```yaml
+# Example: SFT with label smoothing
+loss_type: nll
+label_smoothing: 0.1
+```
+
+**Auxiliary losses:**
+
+Clicker supports auxiliary loss functions that can be combined with the main loss to improve training. These are weighted and added to the primary loss. All weights default to `0.0` (disabled).
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `aux_loss_eos_weight` | float | `0.0` | EOS calibration loss — trains the model to predict EOS at turn boundaries. Requires `assistant_only_loss: true`. Typical: 0.05-0.2 |
+| `aux_loss_rep_weight` | float | `0.0` | Repetition penalty loss — penalizes high probability on tokens that appeared recently in the sequence. Typical: 0.01-0.1 |
+| `aux_loss_rep_window` | int | `64` | Sliding window size (in tokens) for the repetition penalty |
+| `aux_loss_diversity_weight` | float | `0.0` | Vocabulary diversity loss — upweights rare tokens and downweights common tokens via inverse-frequency weighting. Typical: 0.01-0.1 |
+| `aux_loss_diversity_max_ratio` | float | `5.0` | Clamping ratio for diversity weights to prevent outliers |
+| `aux_loss_confidence_weight` | float | `0.0` | Entropy-based confidence regularization — penalizes low-entropy (overconfident) distributions across the full vocabulary. Typical: 0.01-0.05 |
+| `aux_loss_top_prob_weight` | float | `0.0` | Top-probability penalty — directly penalizes the model's peak probability at each position. A sharper alternative to entropy-based confidence regularization. Typical: 0.01-0.1 |
 
 ```yaml
 # Example: SFT with auxiliary losses
@@ -444,15 +460,16 @@ max_length: 4096
 # Main loss
 loss_type: nll
 
-# Auxiliary losses (all optional, set to null to disable)
+# Auxiliary losses (all optional, 0.0 = disabled)
+aux_loss_eos_weight: 0.1          # Boost EOS prediction at turn boundaries
 aux_loss_rep_weight: 0.05         # Reduce repetition
-aux_loss_rep_window: 128          # Check last 128 tokens for repetition
+aux_loss_rep_window: 64           # Check last 64 tokens for repetition
 aux_loss_diversity_weight: 0.05   # Encourage vocabulary diversity
-aux_loss_confidence_weight: 0.02  # Prevent overconfidence
-aux_loss_eos_weight: 0.1          # Boost EOS prediction (good for chat)
+aux_loss_confidence_weight: 0.02  # Prevent overconfidence (entropy-based)
+aux_loss_top_prob_weight: 0.05    # Prevent overconfidence (peak probability)
 ```
 
-**Note:** Auxiliary losses are incompatible with `use_cce: true` (Cut Cross-Entropy). If you need memory savings, choose one or the other.
+**Note:** Auxiliary losses require logits and are incompatible with `use_cce: true` (Cut Cross-Entropy) and Liger kernels.
 
 ---
 

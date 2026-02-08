@@ -1027,11 +1027,37 @@ def _process_single_dataset(
         Tuple of (train_dataset, eval_dataset). Either can be None.
     """
     logger.info(f"Loading dataset for mixture: {dataset_config.path} (config name: {dataset_config.name})")
+
+    load_path = dataset_config.path
+    load_data_files = dataset_config.data_files
+
+    # If path points to a local file (not a directory or Hub ID), use the appropriate
+    # format loader with data_files instead of passing the file path directly.
+    # datasets.load_dataset() expects a directory, Hub ID, or builder name — not a file path.
+    if os.path.isfile(load_path):
+        _ext_to_loader = {
+            ".json": "json",
+            ".jsonl": "json",
+            ".csv": "json",
+            ".parquet": "parquet",
+            ".arrow": "arrow",
+            ".txt": "text",
+        }
+        ext = os.path.splitext(load_path)[1].lower()
+        loader = _ext_to_loader.get(ext)
+        if loader is None:
+            raise ValueError(
+                f"Dataset path '{load_path}' is a file but has unsupported extension '{ext}'. "
+                f"Supported: {', '.join(sorted(_ext_to_loader.keys()))}"
+            )
+        load_data_files = load_path
+        load_path = loader
+
     dataset = datasets.load_dataset(
-        path=dataset_config.path,
+        path=load_path,
         name=dataset_config.name,
         data_dir=dataset_config.data_dir,
-        data_files=dataset_config.data_files,
+        data_files=load_data_files,
         split=dataset_config.split,
         streaming=mixture_config.streaming,
     )
@@ -1305,8 +1331,8 @@ def validate_blend_metadata(prepared_path: str, training_config: dict) -> list[s
 
     Returns a list of mismatch descriptions. Empty list means everything matches.
 
-    Note: eval_split is read from the data_config file (not training_config)
-    since it's a data preparation setting.
+    The training_config dict should be built via build_blend_config(), which
+    handles precedence (training args > data_config > defaults).
     """
     metadata = _load_blend_metadata(prepared_path)
     if metadata is None:
@@ -1329,11 +1355,18 @@ def validate_blend_metadata(prepared_path: str, training_config: dict) -> list[s
         if config_val is not None and meta_val is not None and str(meta_val) != str(config_val):
             mismatches.append(f"  {label}: blend has '{meta_val}', config has '{config_val}'")
 
-    # Check eval_split separately (float comparison) - read from data_config
+    # Check eval_split separately (float comparison)
     meta_eval = metadata.get("eval_split", 0.0)
     config_eval = training_config.get("eval_split", 0.0)
     if abs(float(meta_eval) - float(config_eval)) > 1e-6:
         mismatches.append(f"  Eval split: blend has {meta_eval}, config has {config_eval}")
+
+    # Check split_seed (only matters if eval_split > 0)
+    if config_eval > 0:
+        meta_seed = metadata.get("split_seed", 42)
+        config_seed = training_config.get("split_seed", 42)
+        if meta_seed != config_seed:
+            mismatches.append(f"  Split seed: blend has {meta_seed}, config has {config_seed}")
 
     return mismatches
 
@@ -1354,17 +1387,32 @@ def build_blend_config(training_args, model_args) -> dict:
     """
     Build the config dict that blend.prepare_dataset() expects from SFT training args.
 
-    Note: eval_split and split_seed are read from the data_config file (not training_args)
-    since they're data preparation settings that live in the data config.
+    Config value precedence (highest to lowest):
+      1. training_args (main training config)
+      2. data_config file
+      3. hardcoded defaults
+
+    This allows users to set defaults in data_config (tied to the dataset) while
+    overriding specific values in the main training config for experiments.
     """
-    # Load eval_split and split_seed from data_config if available
-    eval_split = 0.0
-    split_seed = 42
+    # Load data_config as base values
+    data_config = {}
     if training_args.data_config and os.path.exists(training_args.data_config):
         with open(training_args.data_config) as f:
             data_config = yaml.safe_load(f) or {}
-        eval_split = data_config.get("eval_split", 0.0)
-        split_seed = data_config.get("split_seed", 42)
+
+    # Helper to get value with precedence: training_args > data_config > default
+    def get_with_precedence(attr_name, default=None):
+        # Check training_args first (main config)
+        val = getattr(training_args, attr_name, None)
+        if val is not None:
+            return val
+        # Fall back to data_config
+        val = data_config.get(attr_name)
+        if val is not None:
+            return val
+        # Fall back to default
+        return default
 
     config = {
         "model_name_or_path": model_args.model_name_or_path,
@@ -1373,20 +1421,22 @@ def build_blend_config(training_args, model_args) -> dict:
         "max_length": training_args.max_length,
         "truncation_strategy": getattr(training_args, "truncation_strategy", "truncate"),
         "dataset_text_field": getattr(training_args, "dataset_text_field", "text"),
-        "eval_split": eval_split,
-        "split_seed": split_seed,
         "prepared_dataset": training_args.prepared_dataset,
+        # These support override from main config
+        "eval_split": get_with_precedence("eval_split", 0.0),
+        "split_seed": get_with_precedence("split_seed", 42),
+        "default_system_message": get_with_precedence("default_system_message"),
+        "assistant_only_loss": get_with_precedence("assistant_only_loss", False),
+        "last_assistant_only_loss": get_with_precedence("last_assistant_only_loss", False),
+        "train_on_incomplete_assistant": get_with_precedence("train_on_incomplete_assistant", False),
+        "fix_turn_order": get_with_precedence("fix_turn_order", False),
+        "fix_turn_order_filler": get_with_precedence("fix_turn_order_filler"),
+        "dataset_num_proc": get_with_precedence("dataset_num_proc"),
+        "chat_template_path": get_with_precedence("chat_template_path"),
     }
 
-    # Optional fields
-    for attr in [
-        "default_system_message", "fix_turn_order", "fix_turn_order_filler",
-        "assistant_only_loss", "last_assistant_only_loss",
-        "train_on_incomplete_assistant", "dataset_num_proc", "chat_template_path",
-    ]:
-        val = getattr(training_args, attr, None)
-        if val is not None:
-            config[attr] = val
+    # Remove None values to keep config clean
+    config = {k: v for k, v in config.items() if v is not None}
 
     return config
 
