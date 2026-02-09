@@ -22,6 +22,7 @@ from typing import Any, Callable, Optional, Union
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 from accelerate import PartialState, logging
 from datasets import Dataset, IterableDataset
 from transformers import (
@@ -830,6 +831,44 @@ def aux_top_prob_penalty_loss(logits, labels):
     return loss
 
 
+_LIGER_AUX_CHUNK_SIZE = 1024  # tokens per chunk for Liger-compatible chunked logit computation
+
+
+class _HiddenStateCapture:
+    """Forward hook helper to capture the last hidden state from a model backbone.
+
+    When Liger kernel is enabled, the model's forward pass computes loss without
+    materializing the full logits tensor. This hook captures the last hidden state
+    so we can compute auxiliary losses from it in chunks.
+
+    When a ``lm_head`` module reference is provided, the hook also clones the
+    lm_head weight at hook time.  This is critical for FSDP FULL_SHARD: when
+    the backbone hook fires we are still inside the root FSDP module's forward,
+    so lm_head.weight is in its unsharded state.  After the model forward
+    returns, FSDP reshards the weight and it can no longer be used directly for
+    our chunked aux-loss computation.  Cloning here gives us an independent
+    copy that persists past the reshard.  Aux-loss gradients still flow back
+    through the hidden states (which is the primary gradient path for
+    regularisation losses).
+    """
+
+    def __init__(self, lm_head=None):
+        self.value = None
+        self.lm_head_weight = None
+        self._lm_head = lm_head
+
+    def __call__(self, module, args, output):
+        if isinstance(output, tuple):
+            self.value = output[0]
+        elif hasattr(output, "last_hidden_state"):
+            self.value = output.last_hidden_state
+        else:
+            self.value = output[0]
+        # Capture lm_head weight while FSDP params are still unsharded.
+        if self._lm_head is not None:
+            self.lm_head_weight = self._lm_head.weight.detach().clone()
+
+
 class SFTTrainer(BaseTrainer):
     """
     Trainer for Supervised Fine-Tuning (SFT) method.
@@ -1212,18 +1251,27 @@ class SFTTrainer(BaseTrainer):
         # Loss function
         if args.loss_type == "nll":
             if (args.label_smoothing or 0) > 0:
-                if compute_loss_func is not None:
-                    raise ValueError(
-                        "You passed a `compute_loss_func` together with `label_smoothing > 0` to the `SFTTrainer`. "
-                        "When using label smoothing, the loss function is internally set, so passing a "
-                        "`compute_loss_func` is not allowed."
+                if args.use_liger_kernel:
+                    # With Liger: don't set compute_loss_func (Liger handles NLL internally).
+                    # The label smoothing correction is applied via chunked logit computation
+                    # in _compute_chunked_aux_losses().
+                    logger.info(
+                        f"Label smoothing (factor={args.label_smoothing}) with Liger kernel: "
+                        "NLL computed by Liger, smoothing correction applied via chunked logits."
                     )
-                from functools import partial
+                else:
+                    if compute_loss_func is not None:
+                        raise ValueError(
+                            "You passed a `compute_loss_func` together with `label_smoothing > 0` to the `SFTTrainer`. "
+                            "When using label smoothing, the loss function is internally set, so passing a "
+                            "`compute_loss_func` is not allowed."
+                        )
+                    from functools import partial
 
-                compute_loss_func = partial(
-                    nll_loss_with_label_smoothing, label_smoothing=args.label_smoothing
-                )
-                logger.info(f"Label smoothing enabled (factor={args.label_smoothing})")
+                    compute_loss_func = partial(
+                        nll_loss_with_label_smoothing, label_smoothing=args.label_smoothing
+                    )
+                    logger.info(f"Label smoothing enabled (factor={args.label_smoothing})")
         elif args.loss_type == "dft":
             if compute_loss_func is not None:
                 raise ValueError(
@@ -1248,12 +1296,18 @@ class SFTTrainer(BaseTrainer):
             or (args.aux_loss_confidence_weight or 0) > 0
             or (args.aux_loss_top_prob_weight or 0) > 0
         )
-        if has_any_aux_loss and (args.use_liger_kernel or args.use_cce):
+        if has_any_aux_loss and args.use_cce:
             logger.warning(
                 "Auxiliary losses (aux_loss_*) are configured but will be IGNORED because "
-                f"{'use_cce=True' if args.use_cce else 'use_liger_kernel=True'} is enabled. "
-                "CCE and Liger compute loss without materializing logits, so auxiliary losses that "
-                "require logits cannot be computed. Disable CCE/Liger to use auxiliary losses."
+                "use_cce=True is enabled. CCE computes loss without materializing logits, and "
+                "chunked aux loss computation is not supported with CCE. Disable CCE to use "
+                "auxiliary losses."
+            )
+        if has_any_aux_loss and args.use_liger_kernel:
+            logger.info(
+                "Auxiliary losses with Liger kernel: logits will be computed in chunks from "
+                "hidden states for aux loss computation while Liger handles the main CE loss "
+                f"efficiently. Chunk size: {_LIGER_AUX_CHUNK_SIZE} tokens."
             )
         if (args.aux_loss_eos_weight or 0) > 0 and not (args.assistant_only_loss or args.last_assistant_only_loss):
             logger.warning(
@@ -1360,6 +1414,345 @@ class SFTTrainer(BaseTrainer):
                 "Either set `router_aux_loss_coef` to a value greater than `0.0`, or set "
                 "`output_router_logits` to `False` if you don't want to use the MoE auxiliary loss."
             )
+
+        # Set up Liger kernel hidden state capture for chunked aux loss computation
+        self._liger_needs_chunked = False
+        self._liger_hidden_capture = None
+        needs_ls_correction = args.use_liger_kernel and (args.label_smoothing or 0) > 0
+        if args.use_liger_kernel and (has_any_aux_loss or needs_ls_correction):
+            self._liger_needs_chunked = True
+            self._setup_liger_aux_hook()
+
+    def _get_lm_head_module(self):
+        """Get the lm_head module, navigating through PEFT and DDP wrapping."""
+        model = self.accelerator.unwrap_model(self.model)
+        if is_peft_available() and isinstance(model, PeftModel):
+            return model.base_model.model.lm_head
+        return model.lm_head
+
+    def _setup_liger_aux_hook(self):
+        """Register a forward hook on the model backbone to capture last hidden states.
+
+        When Liger's fused linear cross entropy is active, the model's forward pass
+        does not materialize logits. This hook captures the last hidden state so we
+        can compute logits in chunks for auxiliary loss computation.
+
+        The hook also captures the lm_head weight at hook time so that the full
+        (unsharded) weight is available for aux-loss computation even when FSDP
+        FULL_SHARD reshards it after the model forward returns.
+        """
+        model = self.accelerator.unwrap_model(self.model)
+        if is_peft_available() and isinstance(model, PeftModel):
+            backbone = model.base_model.model.model
+            lm_head = model.base_model.model.lm_head
+        else:
+            backbone = model.model
+            lm_head = model.lm_head
+        self._liger_hidden_capture = _HiddenStateCapture(lm_head=lm_head)
+        backbone.register_forward_hook(self._liger_hidden_capture)
+        logger.info("Registered hidden state capture hook for Liger + aux losses")
+
+    def _compute_chunked_aux_losses(self, hidden_states, labels, assistant_masks, mode):
+        """Compute auxiliary losses from hidden states in chunks (Liger-compatible).
+
+        When Liger kernel is enabled, the model's forward pass computes the main CE loss
+        without materializing the full logits tensor. This method computes auxiliary losses
+        by projecting hidden states through lm_head in chunks, keeping peak memory low.
+
+        Each chunk's computation is wrapped in torch.utils.checkpoint to avoid storing
+        all chunks' logits simultaneously during backward.
+
+        Also computes the label smoothing correction when label_smoothing > 0.
+        """
+        if hidden_states is None:
+            return torch.tensor(0.0, device=labels.device, requires_grad=True)
+
+        # Get the lm_head weight.  Prefer the copy captured during the
+        # backbone forward hook — this is the only reliable way to get the
+        # unsharded weight when FSDP FULL_SHARD is active (FSDP reshards
+        # after the model forward returns).
+        lm_head_weight = None
+        if self._liger_hidden_capture is not None:
+            lm_head_weight = self._liger_hidden_capture.lm_head_weight
+
+        if lm_head_weight is None:
+            # Fallback for non-FSDP / FSDP SHARD_GRAD_OP / DDP / single GPU
+            lm_head = self._get_lm_head_module()
+            lm_head_weight = lm_head.weight.detach()
+
+        return self._compute_chunked_aux_losses_inner(
+            hidden_states, labels, assistant_masks, mode, lm_head_weight
+        )
+
+    def _compute_chunked_aux_losses_inner(self, hidden_states, labels, assistant_masks, mode, lm_head_weight):
+        """Inner implementation of chunked aux losses with the lm_head weight already gathered."""
+        # Aux loss config
+        eos_w = self.args.aux_loss_eos_weight or 0
+        rep_w = self.args.aux_loss_rep_weight or 0
+        div_w = self.args.aux_loss_diversity_weight or 0
+        conf_w = self.args.aux_loss_confidence_weight or 0
+        tp_w = self.args.aux_loss_top_prob_weight or 0
+        ls_alpha = self.args.label_smoothing or 0
+        rep_window = self.args.aux_loss_rep_window
+        max_ratio = self.args.aux_loss_diversity_max_ratio
+        eos_token_id = self.processing_class.eos_token_id if eos_w > 0 else 0
+
+        # Shift hidden states and labels (same shift as standard loss computation)
+        shift_h = hidden_states[..., :-1, :].contiguous()
+        shift_l = labels[..., 1:].contiguous()
+        B, S, H = shift_h.shape
+        flat_h = shift_h.reshape(-1, H)
+        flat_l = shift_l.reshape(-1)
+        flat_m = flat_l != -100
+        N_trainable = flat_m.sum()
+
+        if N_trainable == 0:
+            return torch.tensor(0.0, device=hidden_states.device, requires_grad=True)
+
+        N = N_trainable.float()
+
+        # Clean labels for repetition loss lookback (replace -100 with 0)
+        flat_cl = flat_l.clone()
+        flat_cl[~flat_m] = 0
+
+        # Pre-compute turn-end mask for EOS loss
+        flat_te = None
+        n_turn_ends = 0
+        if eos_w > 0 and assistant_masks is not None:
+            shift_am = assistant_masks[..., 1:].contiguous().reshape(-1)
+            padded = nn.functional.pad(shift_am, (0, 1), value=0)
+            flat_te = (shift_am == 1) & (padded[1:] == 0) & flat_m
+            n_turn_ends = flat_te.sum().item()
+            if n_turn_ends == 0:
+                eos_w = 0
+
+        # Pre-compute diversity frequency weights (global across batch)
+        div_freq_w = None
+        if div_w > 0:
+            V = lm_head_weight.shape[0]
+            counts = torch.zeros(V, device=hidden_states.device)
+            valid_tokens = flat_l[flat_m]
+            counts.scatter_add_(0, valid_tokens, torch.ones_like(valid_tokens, dtype=counts.dtype))
+            div_freq_w = torch.log(N / (counts + 1.0)) + 1.0
+            # Normalize to mean=1
+            ptw = div_freq_w[flat_cl]
+            ptw[~flat_m] = 0.0
+            wmean = ptw[flat_m].mean()
+            div_freq_w = div_freq_w / (wmean + 1e-8)
+
+        chunk_size = _LIGER_AUX_CHUNK_SIZE
+        total_len = flat_h.shape[0]
+
+        def chunk_loss_fn(h_ck, w_ck, l_ck, m_ck, te_ck, start_idx):
+            """Compute all aux losses for one chunk. Config captured from closure."""
+            logits = nn.functional.linear(h_ck, w_ck)
+            loss = torch.tensor(0.0, device=h_ck.device)
+            n_valid = m_ck.sum()
+            if n_valid == 0:
+                return loss
+
+            # Label smoothing correction: smooth_CE = (1-α)*NLL + α*uniform_CE
+            # Liger already computed NLL. Correction = α*(uniform_CE - NLL).
+            if ls_alpha > 0:
+                log_probs = torch.log_softmax(logits, dim=-1)
+                uniform_ce = -log_probs.mean(dim=-1)  # (chunk,)
+                nll = nn.functional.cross_entropy(
+                    logits, l_ck, ignore_index=-100, reduction="none"
+                )
+                correction = ls_alpha * ((uniform_ce - nll) * m_ck.float()).sum() / N
+                loss = loss + correction
+
+            # Top-probability penalty
+            if tp_w > 0:
+                probs = torch.softmax(logits, dim=-1)
+                top_p = probs.max(dim=-1).values
+                loss = loss + tp_w * (top_p * m_ck.float()).sum() / N
+
+            # Confidence regularization: max_entropy - mean_entropy
+            if conf_w > 0:
+                V_size = logits.shape[-1]
+                lp = torch.log_softmax(logits, dim=-1)
+                ent = -(lp.exp() * lp).sum(dim=-1)
+                max_e_contrib = math.log(V_size) * n_valid.float()
+                conf_loss = (max_e_contrib - (ent * m_ck.float()).sum()) / N
+                loss = loss + conf_w * conf_loss
+
+            # EOS calibration
+            if eos_w > 0 and te_ck is not None and te_ck.any():
+                eos_targets = torch.full_like(l_ck, fill_value=-100)
+                eos_targets[te_ck] = eos_token_id
+                eos_loss = nn.functional.cross_entropy(logits, eos_targets, ignore_index=-100)
+                # Weight by fraction of turn ends in this chunk vs total
+                loss = loss + eos_w * eos_loss * te_ck.sum().float() / n_turn_ends
+
+            # Repetition penalty (needs cross-chunk label context)
+            if rep_w > 0:
+                probs = torch.softmax(logits, dim=-1)
+                clen = h_ck.shape[0]
+                rep_prob = torch.zeros(clen, device=h_ck.device)
+                win = min(rep_window, clen + start_idx - 1)
+                for off in range(1, win + 1):
+                    gi = torch.arange(clen, device=h_ck.device) + start_idx - off
+                    valid = gi >= 0
+                    gi = gi.clamp(min=0)
+                    prev_tok = flat_cl[gi]
+                    prev_valid = valid & flat_m[gi] & m_ck
+                    gathered = torch.gather(
+                        probs, dim=-1, index=prev_tok.unsqueeze(-1)
+                    ).squeeze(-1)
+                    rep_prob = rep_prob + gathered * prev_valid.float()
+                rep_prob = rep_prob / max(win, 1)
+                loss = loss + rep_w * (rep_prob * m_ck.float()).sum() / N
+
+            # Vocabulary diversity
+            if div_w > 0 and div_freq_w is not None:
+                per_token_ce = nn.functional.cross_entropy(
+                    logits, l_ck, ignore_index=-100, reduction="none"
+                )
+                cl2 = l_ck.clone()
+                cl2[~m_ck] = 0
+                ptw2 = div_freq_w[cl2]
+                ptw2[~m_ck] = 0.0
+                if max_ratio > 0:
+                    ptw2 = ptw2.clamp(min=1.0 / max_ratio, max=max_ratio)
+                loss = loss + div_w * (per_token_ce * ptw2 * m_ck.float()).sum() / N
+
+            return loss
+
+        # Main loss accumulation loop (checkpointed per chunk)
+        total_loss = torch.tensor(0.0, device=hidden_states.device)
+        for start in range(0, total_len, chunk_size):
+            end = min(start + chunk_size, total_len)
+            h = flat_h[start:end]
+            l = flat_l[start:end]
+            m = flat_m[start:end]
+            te = flat_te[start:end] if flat_te is not None else None
+
+            cl = torch.utils.checkpoint.checkpoint(
+                chunk_loss_fn, h, lm_head_weight, l, m, te, start,
+                use_reentrant=False,
+            )
+            total_loss = total_loss + cl
+
+        # Compute metrics in a separate no-grad pass (entropy, accuracy, per-loss values)
+        with torch.no_grad():
+            total_entropy_sum = 0.0
+            correct_tokens = 0
+            total_mask_count = 0
+            metric_eos = 0.0
+            metric_rep = 0.0
+            metric_div = 0.0
+            metric_conf = 0.0
+            metric_tp = 0.0
+
+            for start in range(0, total_len, chunk_size):
+                end = min(start + chunk_size, total_len)
+                h = flat_h[start:end].detach()
+                l = flat_l[start:end]
+                m = flat_m[start:end]
+
+                logits = nn.functional.linear(h, lm_head_weight.detach())
+
+                # Entropy
+                lp = torch.log_softmax(logits, dim=-1)
+                ent = -(lp.exp() * lp).sum(dim=-1)
+                total_entropy_sum += (ent * m.float()).sum().item()
+                total_mask_count += m.sum().item()
+
+                # Token accuracy
+                preds = logits.argmax(dim=-1)
+                correct_tokens += ((preds == l) & m).sum().item()
+
+                # Per-loss metric values (unweighted)
+                if tp_w > 0:
+                    probs = torch.softmax(logits, dim=-1)
+                    metric_tp += (probs.max(dim=-1).values * m.float()).sum().item()
+
+                if conf_w > 0:
+                    V_size = logits.shape[-1]
+                    metric_conf += (
+                        math.log(V_size) * m.sum().item()
+                        - (ent * m.float()).sum().item()
+                    )
+
+                if eos_w > 0 and flat_te is not None:
+                    te = flat_te[start:end]
+                    if te.any():
+                        eos_targets = torch.full_like(l, fill_value=-100)
+                        eos_targets[te] = eos_token_id
+                        metric_eos += nn.functional.cross_entropy(
+                            logits, eos_targets, ignore_index=-100
+                        ).item()
+
+                if rep_w > 0:
+                    probs = torch.softmax(logits, dim=-1)
+                    clen = h.shape[0]
+                    rep_prob = torch.zeros(clen, device=h.device)
+                    win = min(rep_window, clen + start - 1)
+                    for off in range(1, win + 1):
+                        gi = torch.arange(clen, device=h.device) + start - off
+                        valid = gi >= 0
+                        gi = gi.clamp(min=0)
+                        prev_tok = flat_cl[gi]
+                        prev_valid = valid & flat_m[gi] & m
+                        gathered = torch.gather(
+                            probs, dim=-1, index=prev_tok.unsqueeze(-1)
+                        ).squeeze(-1)
+                        rep_prob = rep_prob + gathered * prev_valid.float()
+                    rep_prob = rep_prob / max(win, 1)
+                    metric_rep += (rep_prob * m.float()).sum().item()
+
+                if div_w > 0 and div_freq_w is not None:
+                    per_token_ce = nn.functional.cross_entropy(
+                        logits, l, ignore_index=-100, reduction="none"
+                    )
+                    cl2 = l.clone()
+                    cl2[~m] = 0
+                    ptw2 = div_freq_w[cl2]
+                    ptw2[~m] = 0.0
+                    if max_ratio > 0:
+                        ptw2 = ptw2.clamp(min=1.0 / max_ratio, max=max_ratio)
+                    metric_div += (per_token_ce * ptw2 * m.float()).sum().item()
+
+                del logits
+
+            # Log metrics
+            N_item = N_trainable.item()
+            if N_item > 0:
+                entropy_val = torch.tensor(total_entropy_sum / N_item, device=hidden_states.device)
+                self._metrics[mode]["entropy"].append(
+                    self.accelerator.gather_for_metrics(entropy_val).mean().item()
+                )
+                accuracy = correct_tokens / total_mask_count if total_mask_count > 0 else 0.0
+                self._metrics[mode]["mean_token_accuracy"].append(accuracy)
+
+                if tp_w > 0:
+                    tp_val = torch.tensor(metric_tp / N_item, device=hidden_states.device)
+                    self._metrics[mode]["aux_loss_top_prob"].append(
+                        self.accelerator.gather_for_metrics(tp_val).mean().item()
+                    )
+                if conf_w > 0:
+                    conf_val = torch.tensor(metric_conf / N_item, device=hidden_states.device)
+                    self._metrics[mode]["aux_loss_confidence"].append(
+                        self.accelerator.gather_for_metrics(conf_val).mean().item()
+                    )
+                if eos_w > 0:
+                    eos_val = torch.tensor(metric_eos, device=hidden_states.device)
+                    self._metrics[mode]["aux_loss_eos"].append(
+                        self.accelerator.gather_for_metrics(eos_val).mean().item()
+                    )
+                if rep_w > 0:
+                    rep_val = torch.tensor(metric_rep / N_item, device=hidden_states.device)
+                    self._metrics[mode]["aux_loss_rep"].append(
+                        self.accelerator.gather_for_metrics(rep_val).mean().item()
+                    )
+                if div_w > 0:
+                    div_val = torch.tensor(metric_div / N_item, device=hidden_states.device)
+                    self._metrics[mode]["aux_loss_diversity"].append(
+                        self.accelerator.gather_for_metrics(div_val).mean().item()
+                    )
+
+        return total_loss
 
     def _prepare_dataset(
         self,
@@ -1877,10 +2270,24 @@ class SFTTrainer(BaseTrainer):
             if aux_loss is not None:
                 loss = loss + self.aux_loss_coef * aux_loss
 
-        # Compute auxiliary losses (only when logits are available)
-        # CCE and Liger don't return logits - they compute loss without materializing the full logit tensor
+        # Compute auxiliary losses
+        # When Liger is enabled, logits are not materialized — use chunked computation from hidden states.
+        # When CCE is enabled, aux losses are not supported. Standard path uses full logits.
         logits_available = not self.args.use_liger_kernel and not self.args.use_cce
-        if logits_available:
+
+        if self._liger_needs_chunked and self._liger_hidden_capture is not None:
+            # Liger path: compute aux losses (and label smoothing correction) from hidden states
+            hidden_states = self._liger_hidden_capture.value
+            if hidden_states is not None:
+                aux_total = self._compute_chunked_aux_losses(
+                    hidden_states, labels, assistant_masks, mode
+                )
+                loss = loss + aux_total
+                # Metrics (entropy, accuracy) are computed inside _compute_chunked_aux_losses
+            self._liger_hidden_capture.value = None  # release hidden states
+            self._liger_hidden_capture.lm_head_weight = None  # release weight clone
+
+        elif logits_available:
             logits = outputs.logits
             has_any_aux = (
                 (self.args.aux_loss_eos_weight or 0) > 0
@@ -1933,7 +2340,7 @@ class SFTTrainer(BaseTrainer):
                         self.accelerator.gather_for_metrics(top_prob_loss.detach()).mean().item()
                     )
 
-        # Compute entropy
+        # Compute entropy (standard path only — Liger path computes entropy in _compute_chunked_aux_losses)
         if logits_available:
             with torch.no_grad():
                 per_token_entropy = entropy_from_logits(outputs.logits)
@@ -1967,7 +2374,7 @@ class SFTTrainer(BaseTrainer):
             self._total_train_tokens += num_tokens_in_batch
         self._metrics[mode]["num_tokens"] = [self._total_train_tokens]
 
-        # Compute token accuracy if we have labels and if logits are available
+        # Compute token accuracy (standard path only — Liger path computes accuracy in _compute_chunked_aux_losses)
         if logits_available:
             with torch.no_grad():
                 if "shift_labels" in inputs:
