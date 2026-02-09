@@ -177,6 +177,14 @@ class ModelConfig:
         default=False,
         metadata={"help": "Whether to use nested quantization."},
     )
+    model_parallel: bool = field(
+        default=False,
+        metadata={
+            "help": "Use device_map='auto' to split the model across all available GPUs. "
+            "Useful for quantized models too large for a single GPU without needing "
+            "FSDP or DeepSpeed (which are incompatible with QLoRA)."
+        },
+    )
     low_cpu_mem_usage: bool = field(
         default=True,
         metadata={

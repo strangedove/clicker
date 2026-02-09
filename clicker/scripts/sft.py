@@ -135,7 +135,7 @@ def main(script_args, training_args, model_args, dataset_args):
     quantization_config = get_quantization_config(model_args)
     if quantization_config is not None:
         # Passing None would not be treated the same as omitting the argument, so we include it only when valid.
-        model_kwargs["device_map"] = get_kbit_device_map()
+        model_kwargs["device_map"] = get_kbit_device_map(model_parallel=model_args.model_parallel)
         model_kwargs["quantization_config"] = quantization_config
 
     # Create model

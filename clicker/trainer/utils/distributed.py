@@ -1,8 +1,10 @@
 import torch
 from accelerate import PartialState
 
-def get_kbit_device_map() -> dict[str, int] | None:
+def get_kbit_device_map(model_parallel: bool = False) -> dict[str, int] | str | None:
     if torch.cuda.is_available() or is_torch_xpu_available():
+        if model_parallel:
+            return "auto"
         return {"": PartialState().local_process_index}
     else:
         return None
